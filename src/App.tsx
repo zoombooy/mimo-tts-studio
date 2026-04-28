@@ -3,7 +3,9 @@ import {
   addEdge,
   Background,
   BackgroundVariant,
+  BaseEdge,
   Controls,
+  EdgeLabelRenderer,
   Handle,
   MiniMap,
   Position,
@@ -11,6 +13,7 @@ import {
   ReactFlowProvider,
   type Connection,
   type Edge,
+  type EdgeProps,
   type Node,
   type NodeProps,
   type NodeTypes,
@@ -35,6 +38,7 @@ import {
   Trash2
 } from "lucide-react";
 import { ChangeEvent, MouseEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getBezierPath } from "@xyflow/react";
 
 type StatusResponse = {
   ok: boolean;
@@ -69,7 +73,7 @@ type WorkspacesResponse = {
 
 type StudioNodeType = "referenceAudio" | "voiceStyle" | "prompt" | "voiceClone" | "artifact";
 type StudioNode = Node<NodeData, StudioNodeType>;
-type StudioEdge = Edge;
+type StudioEdge = Edge<{ onDeleteEdge?: (edgeId: string) => void }>;
 
 type AudioAsset = {
   fileName: string;
@@ -97,12 +101,19 @@ type NodeData = {
   onPatch?: (nodeId: string, patch: Partial<NodeData>) => void;
   onDelete?: (nodeId: string) => void;
   onRunClone?: (nodeId: string) => void;
+  onOptimizeStyle?: (nodeId: string) => void;
 };
 
 type DebugResponse = {
   audioDataUrl: string;
   fileName: string;
   elapsedMs: number;
+};
+
+type StyleOptimizeResponse = {
+  optimizedText: string;
+  elapsedMs: number;
+  error?: string;
 };
 
 const nodeCatalog: Record<
@@ -197,7 +208,8 @@ function StudioApp() {
     () => ({
       onPatch: patchNode,
       onDelete: deleteNode,
-      onRunClone: runVoiceClone
+      onRunClone: runVoiceClone,
+      onOptimizeStyle: optimizeVoiceStyle
     }),
     [nodes, edges, status?.apiKeyConfigured]
   );
@@ -212,6 +224,17 @@ function StudioApp() {
     }));
   }, [nodes, nodeCallbacks]);
 
+  const hydratedEdges = useMemo(() => {
+    return edges.map((edge) => ({
+      ...edge,
+      type: "deletable",
+      data: {
+        ...edge.data,
+        onDeleteEdge: deleteEdge
+      }
+    }));
+  }, [edges]);
+
   const nodeTypes = useMemo<NodeTypes>(
     () => ({
       referenceAudio: ReferenceAudioNode,
@@ -219,6 +242,13 @@ function StudioApp() {
       prompt: PromptNode,
       voiceClone: VoiceCloneNode,
       artifact: ArtifactNode
+    }),
+    []
+  );
+
+  const edgeTypes = useMemo(
+    () => ({
+      deletable: DeletableEdge
     }),
     []
   );
@@ -324,6 +354,7 @@ function StudioApp() {
         addEdge(
           {
             ...connection,
+            type: "deletable",
             animated: true,
             style: { stroke: "#c5a45d", strokeWidth: 2 }
           },
@@ -353,6 +384,10 @@ function StudioApp() {
     };
     setNodes((items) => [...items, node]);
     setMenu(null);
+  }
+
+  function deleteEdge(edgeId: string) {
+    setEdges((items) => items.filter((edge) => edge.id !== edgeId));
   }
 
   async function runVoiceClone(nodeId: string) {
@@ -404,6 +439,7 @@ function StudioApp() {
         sourceHandle: "output",
         target: artifactNode.id,
         targetHandle: "artifact",
+        type: "deletable",
         animated: true,
         style: { stroke: "#c5a45d", strokeWidth: 2 }
       };
@@ -412,6 +448,51 @@ function StudioApp() {
       setEdges((items) => items.concat(artifactEdge));
     } catch (error) {
       patchNode(nodeId, { isRunning: false, error: error instanceof Error ? error.message : "请求失败。" });
+    }
+  }
+
+  async function optimizeVoiceStyle(nodeId: string) {
+    const styleNode = nodes.find((node) => node.id === nodeId);
+    if (!styleNode || styleNode.type !== "voiceStyle") {
+      return;
+    }
+
+    if (!status?.apiKeyConfigured) {
+      patchNode(nodeId, { error: "API Key 未配置，请先配置 .env 中的 MIMO_API_KEY。" });
+      return;
+    }
+
+    const style = String(styleNode.data.text || "").trim();
+    if (!style) {
+      patchNode(nodeId, { error: "请先填写需要优化的语音风格。" });
+      return;
+    }
+
+    patchNode(nodeId, { isRunning: true, error: undefined });
+
+    try {
+      const response = await fetch("/api/voice-style/optimize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ style })
+      });
+      const payload = (await response.json()) as StyleOptimizeResponse;
+
+      if (!response.ok) {
+        patchNode(nodeId, { isRunning: false, error: payload.error || "AI 优化失败。" });
+        return;
+      }
+
+      patchNode(nodeId, {
+        text: payload.optimizedText,
+        isRunning: false,
+        error: undefined
+      });
+    } catch (error) {
+      patchNode(nodeId, {
+        isRunning: false,
+        error: error instanceof Error ? error.message : "AI 优化请求失败。"
+      });
     }
   }
 
@@ -482,8 +563,9 @@ function StudioApp() {
           <div className="flow-wrap" onContextMenu={openContextMenu}>
             <ReactFlow<StudioNode, StudioEdge>
               nodes={hydratedNodes}
-              edges={edges}
+              edges={hydratedEdges}
               nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
               onInit={(instance) => {
                 flowRef.current = instance;
               }}
@@ -581,6 +663,7 @@ function VoiceStyleNode({ id, data }: NodeProps<StudioNode>) {
         rows={6}
         placeholder="写入语气、情绪、语速、角色和导演指令，并连接到克隆节点的「风格」输入。"
       />
+      {data.error ? <p className="node-error">{data.error}</p> : null}
     </StudioNodeFrame>
   );
 }
@@ -655,7 +738,7 @@ function StudioNodeFrame({
   return (
     <section className={`studio-node node-${tone}`}>
       <header className="node-header">
-        <div>
+        <div className="node-title-wrap">
           {icon}
           <input
             className="node-title-input nodrag"
@@ -664,9 +747,22 @@ function StudioNodeFrame({
             onChange={(event) => data.onPatch?.(id, { title: event.target.value })}
           />
         </div>
-        <button className="icon-button nodrag" type="button" onClick={() => data.onDelete?.(id)} title="删除节点">
-          <Trash2 size={14} />
-        </button>
+        <div className="node-header-actions">
+          {tone === "style" ? (
+            <button
+              className="icon-button optimize-icon nodrag"
+              type="button"
+              onClick={() => data.onOptimizeStyle?.(id)}
+              disabled={data.isRunning}
+              title={data.isRunning ? "AI优化中" : "AI优化语音风格"}
+            >
+              {data.isRunning ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+            </button>
+          ) : null}
+          <button className="icon-button nodrag" type="button" onClick={() => data.onDelete?.(id)} title="删除节点">
+            <Trash2 size={14} />
+          </button>
+        </div>
       </header>
       {children}
     </section>
@@ -694,6 +790,56 @@ function StatusPill({ status, error, onRefresh }: { status: StatusResponse | nul
     <button className={`status-pill ${tone}`} type="button" onClick={onRefresh}>
       {text}
     </button>
+  );
+}
+
+function DeletableEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  style,
+  markerEnd,
+  data
+}: EdgeProps<StudioEdge>) {
+  const [isHovered, setIsHovered] = useState(false);
+  const [edgePath, labelX, labelY] = getBezierPath({
+    sourceX,
+    sourceY,
+    sourcePosition,
+    targetX,
+    targetY,
+    targetPosition
+  });
+
+  return (
+    <>
+      <g onMouseEnter={() => setIsHovered(true)} onMouseLeave={() => setIsHovered(false)}>
+        <path className="edge-hover-path" d={edgePath} />
+        <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={style} />
+      </g>
+      <EdgeLabelRenderer>
+        <button
+          className={isHovered ? "edge-delete visible" : "edge-delete"}
+          onClick={(event) => {
+            event.stopPropagation();
+            data?.onDeleteEdge?.(id);
+          }}
+          onMouseEnter={() => setIsHovered(true)}
+          onMouseLeave={() => setIsHovered(false)}
+          style={{
+            transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`
+          }}
+          title="断开链接"
+          type="button"
+        >
+          ×
+        </button>
+      </EdgeLabelRenderer>
+    </>
   );
 }
 
@@ -801,7 +947,7 @@ function createArtifactNode(sourceNode: StudioNode, result: DebugResponse): Stud
 }
 
 function stripNodeCallbacks(node: StudioNode): StudioNode {
-  const { onPatch, onDelete, onRunClone, ...data } = node.data;
+  const { onPatch, onDelete, onRunClone, onOptimizeStyle, ...data } = node.data;
   return { ...node, data };
 }
 

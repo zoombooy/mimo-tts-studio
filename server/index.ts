@@ -44,11 +44,16 @@ type MimoPayload = {
 type MimoResponse = {
   choices?: Array<{
     message?: {
+      content?: string;
       audio?: {
         data?: string;
       };
     };
   }>;
+};
+
+type VoiceStyleOptimizePayload = {
+  style: string;
 };
 
 type StoredWorkspace = {
@@ -78,6 +83,88 @@ app.get("/api/status", (_req, res) => {
     maxAudioBytes,
     allowedMimeTypes: Array.from(allowedMimeTypes)
   });
+});
+
+app.post("/api/voice-style/optimize", async (req: Request<unknown, unknown, VoiceStyleOptimizePayload>, res, next) => {
+  const startedAt = Date.now();
+
+  try {
+    const apiKey = process.env.MIMO_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error: "MIMO_API_KEY is not configured. Copy .env.example to .env and set your key."
+      });
+    }
+
+    const style = String(req.body?.style || "").trim();
+    if (!style) {
+      return res.status(400).json({ error: "Voice style text is required." });
+    }
+
+    const payload = {
+      model: "mimo-v2-flash",
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是专业的中文有声内容导演和 TTS 语音风格提示词编辑。你的任务是把用户粗略的语音风格描述优化为更适合语音克隆合成模型理解的导演文本。只输出优化后的提示词，不要解释，不要使用 Markdown。"
+        },
+        {
+          role: "user",
+          content: [
+            "请优化下面的语音风格描述，使其更具体、可执行、适合语音克隆 TTS：",
+            "",
+            "要求：",
+            "1. 保留用户原本想要的情绪和风格，不要改成另一个角色。",
+            "2. 补充语速、停顿、重音、气息、音色质感、情绪层次和表达场景。",
+            "3. 避免混响、EQ、压缩等后期制作词。",
+            "4. 输出一段 80 到 160 字的中文导演文本。",
+            "",
+            `用户原文：${style}`
+          ].join("\n")
+        }
+      ],
+      temperature: 0.6
+    };
+
+    const upstreamResponse = await fetch(mimoEndpoint, {
+      method: "POST",
+      headers: {
+        "api-key": apiKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await upstreamResponse.text();
+    const elapsedMs = Date.now() - startedAt;
+    const parsed = parseJson(responseText);
+
+    if (!upstreamResponse.ok) {
+      return res.status(upstreamResponse.status).json({
+        error: "MiMo style optimization request failed.",
+        status: upstreamResponse.status,
+        elapsedMs,
+        details: parsed ?? responseText
+      });
+    }
+
+    const optimizedText = extractMessageContent(parsed);
+    if (!optimizedText) {
+      return res.status(502).json({
+        error: "MiMo response did not include choices[0].message.content.",
+        elapsedMs,
+        details: parsed
+      });
+    }
+
+    res.json({
+      optimizedText: optimizedText.trim(),
+      elapsedMs
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/workspaces", async (_req, res, next) => {
@@ -374,6 +461,12 @@ function extractAudioData(value: unknown): string | null {
   const response = value as MimoResponse;
   const data = response.choices?.[0]?.message?.audio?.data;
   return typeof data === "string" && data.length > 0 ? data : null;
+}
+
+function extractMessageContent(value: unknown): string | null {
+  const response = value as MimoResponse;
+  const content = response.choices?.[0]?.message?.content;
+  return typeof content === "string" && content.length > 0 ? content : null;
 }
 
 function getChoiceCount(value: unknown): number {

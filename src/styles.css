@@ -321,19 +321,20 @@ h1 {
 }
 
 .node-header {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
-  align-items: center;
+  align-items: start;
   margin-bottom: 10px;
+  position: relative;
 }
 
-.node-header > div {
+.node-title-wrap {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  flex: 1;
+  padding-right: 8px;
 }
 
 .node-header svg {
@@ -363,6 +364,22 @@ h1 {
   width: 30px;
   min-height: 30px;
   padding: 0;
+}
+
+.node-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-self: end;
+  margin-top: -5px;
+  margin-right: -8px;
+  z-index: 2;
+}
+
+.optimize-icon {
+  color: #f2dfae;
+  border-color: rgba(226, 194, 119, 0.62);
+  background: rgba(197, 164, 93, 0.12);
 }
 
 .file-picker {
@@ -396,6 +413,15 @@ h1 {
   display: grid;
   gap: 6px;
   margin-top: 10px;
+}
+
+.studio-node textarea {
+  scrollbar-width: none;
+}
+
+.studio-node textarea::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .node-field span {
@@ -573,6 +599,44 @@ h1 {
 
 .context-menu small {
   color: #9f947b;
+}
+
+.edge-hover-path {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 18;
+  pointer-events: stroke;
+}
+
+.edge-delete {
+  position: absolute;
+  width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  border-color: rgba(226, 194, 119, 0.78);
+  background: rgba(15, 15, 13, 0.96);
+  color: #f2dfae;
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 18px;
+  line-height: 1;
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease,
+    background 120ms ease;
+}
+
+.edge-delete.visible {
+  opacity: 1;
+  pointer-events: all;
+}
+
+.edge-delete:hover {
+  background: rgba(126, 47, 36, 0.96);
+  border-color: rgba(255, 181, 169, 0.82);
+  color: #ffe6df;
 }
 
 .spin {
