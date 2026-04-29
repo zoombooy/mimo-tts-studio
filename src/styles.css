@@ -572,6 +572,31 @@ a.stash-round-action:hover {
   border-color: rgba(197, 164, 93, 0.75);
 }
 
+.comment-node {
+  width: 260px;
+  background: rgba(39, 36, 29, 0.8);
+  border: 1px dashed rgba(197, 164, 93, 0.4);
+  border-radius: 6px;
+  padding: 10px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+}
+
+.comment-node textarea {
+  width: 100%;
+  min-height: 60px;
+  background: transparent;
+  border: none;
+  color: #c5b68a;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+}
+
+.comment-node textarea::placeholder {
+  color: rgba(197, 164, 93, 0.4);
+}
+
 .node-design {
   width: 370px;
   border-color: rgba(173, 188, 255, 0.62);

@@ -78,7 +78,7 @@ type WorkspacesResponse = {
   workspaces: WorkspaceSummary[];
 };
 
-type StudioNodeType = "referenceAudio" | "voiceStyle" | "prompt" | "voiceClone" | "voiceDesign" | "artifact";
+type StudioNodeType = "referenceAudio" | "voiceStyle" | "prompt" | "voiceClone" | "voiceDesign" | "artifact" | "comment";
 type StudioNode = Node<NodeData, StudioNodeType>;
 type StudioEdge = Edge<{ onDeleteEdge?: (edgeId: string) => void }>;
 
@@ -176,6 +176,11 @@ const nodeCatalog: Record<
     label: "产物",
     description: "保存生成结果和下载入口",
     defaultData: () => ({ title: "音频产物" })
+  },
+  comment: {
+    label: "文本注释",
+    description: "画布上的备注说明",
+    defaultData: () => ({ title: "注释", text: "" })
   }
 };
 
@@ -305,7 +310,8 @@ function StudioApp() {
       prompt: PromptNode,
       voiceClone: VoiceCloneNode,
       voiceDesign: VoiceDesignNode,
-      artifact: ArtifactNode
+      artifact: ArtifactNode,
+      comment: CommentNode
     }),
     []
   );
@@ -1415,6 +1421,20 @@ function ReferenceAudioNode({ id, data }: NodeProps<StudioNode>) {
       {previewUrl ? <StudioAudioPlayer src={previewUrl} /> : null}
       {data.error ? <p className="node-error">{data.error}</p> : null}
     </StudioNodeFrame>
+  );
+}
+
+function CommentNode({ id, data }: NodeProps<StudioNode>) {
+  return (
+    <div className="comment-node">
+      <textarea
+        className="nodrag"
+        value={data.text ?? ""}
+        onChange={(event) => data.onPatch?.(id, { text: event.target.value })}
+        rows={3}
+        placeholder="添加注释..."
+      />
+    </div>
   );
 }
 
