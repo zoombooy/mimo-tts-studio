@@ -2,13 +2,45 @@
   "name": "mimo-voiceclone-debugger",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n server,client -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite --host 0.0.0.0",
     "dev:server": "tsx watch server/index.ts",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "build": "tsc -b && vite build && esbuild server/index.ts --bundle --platform=node --format=cjs --target=node22 --outfile=build/server/index.cjs",
+    "preview": "vite preview --host 0.0.0.0",
+    "electron": "npm run build && electron electron/main.cjs",
+    "dist:win": "npm run build && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.mimo.audio-workstation",
+    "productName": "MiMo Audio Workstation",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist",
+        "to": "dist"
+      },
+      {
+        "from": "build/server",
+        "to": "server"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.0.4",
@@ -31,6 +63,8 @@
     "@types/node": "^24.7.2",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
+    "electron": "^41.3.0",
+    "electron-builder": "^26.8.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }

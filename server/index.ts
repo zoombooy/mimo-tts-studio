@@ -9,6 +9,7 @@ dotenv.config();
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
+const staticDir = process.env.MIMO_STATIC_DIR ? path.resolve(process.env.MIMO_STATIC_DIR) : "";
 const maxAudioBytes = Math.floor(7.5 * 1024 * 1024);
 const allowedMimeTypes = new Set([
   "audio/mpeg",
@@ -21,7 +22,7 @@ const allowedMimeTypes = new Set([
   "video/mp4"
 ]);
 const mimoEndpoint = "https://api.xiaomimimo.com/v1/chat/completions";
-const dataDir = path.resolve(process.cwd(), "data");
+const dataDir = path.resolve(process.env.MIMO_DATA_DIR || path.join(process.cwd(), "data"));
 const workspaceFilePath = path.join(dataDir, "workspaces.json");
 
 const upload = multer({
@@ -718,6 +719,13 @@ app.post("/api/tts/voiceclone", upload.single("voice"), async (req: Request, res
   }
 });
 
+if (staticDir) {
+  app.use(express.static(staticDir));
+  app.get(/^(?!\/api).*/, (_req: Request, res: Response) => {
+    res.sendFile(path.join(staticDir, "index.html"));
+  });
+}
+
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (error instanceof multer.MulterError) {
     if (error.code === "LIMIT_FILE_SIZE") {
@@ -733,9 +741,24 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: message });
 });
 
-app.listen(port, () => {
-  console.log(`MiMo voice clone proxy listening on http://localhost:${port}`);
-});
+export function startServer(listenPort = port, host?: string) {
+  const server = host ? app.listen(listenPort, host) : app.listen(listenPort);
+
+  server.once("listening", () => {
+    const address = server.address();
+    const resolvedPort = typeof address === "object" && address ? address.port : listenPort;
+    const resolvedHost = host || "localhost";
+    console.log(`MiMo voice clone proxy listening on http://${resolvedHost}:${resolvedPort}`);
+  });
+
+  return server;
+}
+
+export { app };
+
+if (process.env.MIMO_NO_AUTO_LISTEN !== "1") {
+  startServer(port);
+}
 
 function resolveVoiceMimeType(file: Express.Multer.File): "audio/mp3" | "audio/m4a" | "audio/wav" | null {
   const extension = file.originalname.split(".").pop()?.toLowerCase();
