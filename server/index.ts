@@ -84,6 +84,7 @@ type VoiceDesignPayload = {
 
 type SmartWorkspacePlan = {
   workspaceName?: unknown;
+  voiceDescription?: unknown;
   segments?: unknown;
 };
 
@@ -356,13 +357,10 @@ app.post("/api/workspaces/smart", upload.single("voice"), async (req: Request, r
     const sceneDescription = String(req.body?.sceneDescription || "").trim();
     const script = String(req.body?.script || "").trim();
     const scriptSegments = splitScriptSegments(script);
+    const hasReferenceAudio = Boolean(req.file);
 
-    if (!req.file) {
-      return res.status(400).json({ error: "Reference audio is required." });
-    }
-
-    const voiceMime = resolveVoiceMimeType(req.file);
-    if (!voiceMime) {
+    const voiceMime = req.file ? resolveVoiceMimeType(req.file) : null;
+    if (req.file && !voiceMime) {
       return res.status(400).json({
         error: "Unsupported audio type. Please upload an mp3, m4a/mp4 audio, or wav file.",
         receivedMimeType: req.file.mimetype,
@@ -391,11 +389,13 @@ app.post("/api/workspaces/smart", upload.single("voice"), async (req: Request, r
         {
           role: "system",
           content:
-            "你是专业的中文有声内容导演和工作流策划助手。你只根据用户给出的整体场景描述和逐段台词，为每段生成短标题和适合语音克隆 TTS 的语音风格文本。语音风格文本主要描述整体氛围、情绪、角色状态和表达质感，不要写具体台词的停顿、重音或逐句朗读指令。必须输出严格 JSON，不要使用 Markdown，不要输出解释。"
+            hasReferenceAudio
+              ? "你是专业的中文有声内容导演和工作流策划助手。你只根据用户给出的整体场景描述和逐段台词，为每段生成短标题和适合语音克隆 TTS 的语音风格文本。语音风格文本主要描述整体氛围、情绪、角色状态和表达质感，不要写具体台词的停顿、重音或逐句朗读指令。必须输出严格 JSON，不要使用 Markdown，不要输出解释。"
+              : "你是专业的中文有声内容导演、TTS 音色设计师和工作流策划助手。用户没有提供参考音频，你需要设计一个贯穿全片的统一音色，并为每段生成短标题和语音风格文本。每段应尽可能保持同一音色，只在语速、情绪和表达氛围上根据段落变化。必须输出严格 JSON，不要使用 Markdown，不要输出解释。"
         },
         {
           role: "user",
-          content: buildSmartWorkspacePrompt(sceneDescription, scriptSegments)
+          content: hasReferenceAudio ? buildSmartWorkspacePrompt(sceneDescription, scriptSegments) : buildSmartVoiceDesignWorkspacePrompt(sceneDescription, scriptSegments)
         }
       ],
       temperature: 0.35,
@@ -458,7 +458,8 @@ app.post("/api/workspaces/smart", upload.single("voice"), async (req: Request, r
       scriptSegments,
       segments,
       file: req.file,
-      voiceMime
+      voiceMime,
+      voiceDescription: String(plan.voiceDescription || "").trim()
     });
 
     store.workspaces.unshift(workspace);
@@ -872,6 +873,32 @@ function buildSmartWorkspacePrompt(sceneDescription: string, scriptSegments: str
   ].join("\n");
 }
 
+function buildSmartVoiceDesignWorkspacePrompt(sceneDescription: string, scriptSegments: string[]): string {
+  return [
+    "请为下面的有声内容台词生成智能画板分段规划。用户没有提供参考音频，后续会使用文本设计音色的方式合成每段音频。",
+    "",
+    "整体场景描述：",
+    sceneDescription,
+    "",
+    "分段台词：",
+    scriptSegments.map((segment, index) => `第 ${index + 1} 段：\n${segment}`).join("\n\n"),
+    "",
+    "输出要求：",
+    "1. 只输出严格 JSON，不要 Markdown，不要代码块，不要解释。",
+    "2. 不要改写台词正文；你只负责生成 workspaceName、voiceDescription、每段 title 和 directorText。",
+    "3. voiceDescription 是贯穿所有片段的统一音色描述，必须适合 mimo-v2.5-tts-voicedesign 模型，输出 1 到 4 句中文。",
+    "4. voiceDescription 应描述性别与年龄、声音质感、情绪/语气、语速/节奏，可适度包含角色身份、说话风格或使用场景。",
+    "5. 每段应尽可能保持同一音色；voiceDescription 需要能覆盖全部片段的共同声音底色。",
+    "6. segments 数量必须与分段台词数量完全一致，index 从 1 开始连续递增。",
+    "7. directorText 用于记录每段建议的整体语速、表达氛围、情绪层次和表演意图；不要引用具体台词，不要写“在某句话后停顿”“重音放在某个词上”这类逐句朗读指令。",
+    "8. 不要使用混响、回声、EQ、压缩、母带等后期制作或音频工程术语。",
+    "9. title 应简短，适合用作画板节点名称。",
+    "",
+    "JSON 结构必须是：",
+    '{"workspaceName":"string","voiceDescription":"string","segments":[{"index":1,"title":"string","directorText":"string"}]}'
+  ].join("\n");
+}
+
 function parseSmartWorkspacePlan(content: string): SmartWorkspacePlan | null {
   const trimmed = content.trim();
   const candidates = [
@@ -917,21 +944,24 @@ function createSmartWorkspace({
   scriptSegments,
   segments,
   file,
-  voiceMime
+  voiceMime,
+  voiceDescription
 }: {
   workspaceName: string;
   sceneDescription: string;
   scriptSegments: string[];
   segments: SmartWorkspaceSegment[];
-  file: Express.Multer.File;
-  voiceMime: "audio/mp3" | "audio/m4a" | "audio/wav";
+  file?: Express.Multer.File;
+  voiceMime: "audio/mp3" | "audio/m4a" | "audio/wav" | null;
+  voiceDescription: string;
 }): StoredWorkspace {
   const now = new Date().toISOString();
   const workspaceId = createId("board");
-  const referenceNodeId = createId("referenceAudio");
-  const audioDataUrl = `data:${voiceMime};base64,${file.buffer.toString("base64")}`;
-  const nodes: unknown[] = [
-    {
+  const referenceNodeId = file && voiceMime ? createId("referenceAudio") : "";
+  const nodes: unknown[] = [];
+  if (file && voiceMime) {
+    const audioDataUrl = `data:${voiceMime};base64,${file.buffer.toString("base64")}`;
+    nodes.push({
       id: referenceNodeId,
       type: "referenceAudio",
       position: { x: 40, y: 80 },
@@ -945,19 +975,32 @@ function createSmartWorkspace({
           dataUrl: audioDataUrl
         }
       }
-    }
-  ];
+    });
+  }
   const edges: unknown[] = [];
+  const designNodeId = file && voiceMime ? "" : createId("voiceDesign");
+  if (!file || !voiceMime) {
+    nodes.push({
+      id: designNodeId,
+      type: "voiceDesign",
+      position: { x: 560, y: 120 },
+      data: {
+        title: "统一音色创造",
+        instruction: voiceDescription || "自然、清晰、贴近内容场景的中文叙述音色。",
+        text: ""
+      }
+    });
+  }
 
   segments.forEach((segment, index) => {
     const y = 80 + index * 300;
-    const styleNodeId = createId("voiceStyle");
-    const promptNodeId = createId("prompt");
-    const cloneNodeId = createId("voiceClone");
     const segmentTitle = segment.title || `第 ${index + 1} 段`;
 
-    nodes.push(
-      {
+    if (file && voiceMime) {
+      const styleNodeId = createId("voiceStyle");
+      const promptNodeId = createId("prompt");
+      const cloneNodeId = createId("voiceClone");
+      nodes.push({
         id: styleNodeId,
         type: "voiceStyle",
         position: { x: 400, y },
@@ -965,8 +1008,8 @@ function createSmartWorkspace({
           title: `${segmentTitle} 导演`,
           text: segment.directorText
         }
-      },
-      {
+      });
+      nodes.push({
         id: promptNodeId,
         type: "prompt",
         position: { x: 400, y: y + 150 },
@@ -974,8 +1017,8 @@ function createSmartWorkspace({
           title: `${segmentTitle} 台词`,
           text: scriptSegments[index]
         }
-      },
-      {
+      });
+      nodes.push({
         id: cloneNodeId,
         type: "voiceClone",
         position: { x: 820, y: y + 60 },
@@ -984,14 +1027,27 @@ function createSmartWorkspace({
           instruction: segment.directorText,
           text: scriptSegments[index]
         }
-      }
-    );
+      });
 
-    edges.push(
-      createWorkflowEdge(referenceNodeId, "audio", cloneNodeId, "voice"),
-      createWorkflowEdge(styleNodeId, "style", cloneNodeId, "instruction"),
-      createWorkflowEdge(promptNodeId, "text", cloneNodeId, "text")
-    );
+      edges.push(
+        createWorkflowEdge(referenceNodeId, "audio", cloneNodeId, "voice"),
+        createWorkflowEdge(styleNodeId, "style", cloneNodeId, "instruction"),
+        createWorkflowEdge(promptNodeId, "text", cloneNodeId, "text")
+      );
+      return;
+    }
+
+    const promptNodeId = createId("prompt");
+    nodes.push({
+      id: promptNodeId,
+      type: "prompt",
+      position: { x: 120, y },
+      data: {
+        title: `${segmentTitle} 台词`,
+        text: scriptSegments[index]
+      }
+    });
+    edges.push(createWorkflowEdge(promptNodeId, "text", designNodeId, "text"));
   });
 
   return {

@@ -551,52 +551,58 @@ function StudioApp() {
     }
 
     const voiceDescription = String(designNode.data.instruction || "").trim();
-    const text = String(designNode.data.text || "").trim();
+    const promptInputs = resolveVoiceDesignInputs(designNode, nodes, edges);
+    const textItems = promptInputs.length > 0 ? promptInputs : [{ title: designNode.data.title, text: String(designNode.data.text || "").trim() }];
 
     if (!voiceDescription) {
       patchNode(nodeId, { error: "请先填写音色描述。" });
       return;
     }
 
-    if (!text) {
-      patchNode(nodeId, { error: "请先填写音频文本。" });
+    if (textItems.every((item) => !item.text.trim())) {
+      patchNode(nodeId, { error: "请连接提示词节点，或在节点内填写音频文本。" });
       return;
     }
 
     patchNode(nodeId, { isRunning: true, error: undefined });
 
     try {
-      const response = await fetch("/api/tts/voicedesign", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          voiceDescription,
-          instruction: voiceDescription,
-          text,
-          format: "wav"
-        })
-      });
-      const payload = (await response.json()) as DebugResponse & { error?: string; details?: unknown };
+      const artifactNodes: StudioNode[] = [];
+      const artifactEdges: StudioEdge[] = [];
 
-      if (!response.ok) {
-        patchNode(nodeId, { isRunning: false, error: payload.error || "MiMo 音色创造失败。" });
-        return;
+      for (const [index, item] of textItems.filter((entry) => entry.text.trim()).entries()) {
+        const response = await fetch("/api/tts/voicedesign", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            voiceDescription,
+            text: item.text.trim(),
+            format: "wav"
+          })
+        });
+        const payload = (await response.json()) as DebugResponse & { error?: string; details?: unknown };
+
+        if (!response.ok) {
+          patchNode(nodeId, { isRunning: false, error: payload.error || `第 ${index + 1} 条音色创造失败。` });
+          return;
+        }
+
+        const artifactNode = createArtifactNode(designNode, payload, item.title);
+        artifactNodes.push(artifactNode);
+        artifactEdges.push({
+          id: createId("edge"),
+          source: designNode.id,
+          sourceHandle: "output",
+          target: artifactNode.id,
+          targetHandle: "artifact",
+          type: "deletable",
+          animated: true,
+          style: { stroke: "#c5a45d", strokeWidth: 2 }
+        });
       }
 
-      const artifactNode = createArtifactNode(designNode, payload);
-      const artifactEdge: StudioEdge = {
-        id: createId("edge"),
-        source: designNode.id,
-        sourceHandle: "output",
-        target: artifactNode.id,
-        targetHandle: "artifact",
-        type: "deletable",
-        animated: true,
-        style: { stroke: "#c5a45d", strokeWidth: 2 }
-      };
-
-      setNodes((items) => items.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, isRunning: false, error: undefined } } : node)).concat(artifactNode));
-      setEdges((items) => items.concat(artifactEdge));
+      setNodes((items) => items.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, isRunning: false, error: undefined } } : node)).concat(artifactNodes));
+      setEdges((items) => items.concat(artifactEdges));
     } catch (error) {
       patchNode(nodeId, { isRunning: false, error: error instanceof Error ? error.message : "请求失败。" });
     }
@@ -965,10 +971,6 @@ function BoardCreateDialog({
 
   async function submitSmartWorkspace() {
     const paragraphs = splitScriptInput(script);
-    if (!voiceFile) {
-      setError("请上传或录制参考音频。");
-      return;
-    }
     if (!sceneDescription.trim()) {
       setError("请填写场景描述。");
       return;
@@ -982,7 +984,9 @@ function BoardCreateDialog({
     setError(null);
     try {
       const formData = new FormData();
-      formData.append("voice", voiceFile);
+      if (voiceFile) {
+        formData.append("voice", voiceFile);
+      }
       formData.append("sceneDescription", sceneDescription.trim());
       formData.append("script", script.trim());
       await onCreateSmart(formData);
@@ -1000,7 +1004,7 @@ function BoardCreateDialog({
         <header className="modal-header">
           <div>
             <strong>{mode === "choice" ? "新建画板" : "智能画板"}</strong>
-            <span>{mode === "choice" ? "选择创建方式" : "根据音频、场景和文稿生成工作流"}</span>
+            <span>{mode === "choice" ? "选择创建方式" : "根据场景、文稿和可选参考音频生成工作流"}</span>
           </div>
           <button className="icon-button" type="button" onClick={onClose} title="关闭">
             ×
@@ -1017,15 +1021,15 @@ function BoardCreateDialog({
             <button type="button" onClick={() => onSwitchMode("smart")}>
               <Sparkles size={18} />
               <span>智能画板</span>
-              <small>用场景、参考音频和文稿生成分段工作流</small>
+              <small>有参考音频则生成克隆链路，无参考音频则生成音色创造链路</small>
             </button>
           </div>
         ) : (
           <div className="smart-board-form">
             <label className="file-picker nodrag">
               <input accept="audio/*,video/mp4,.mp3,.m4a,.mp4,.wav" type="file" onChange={onFileChange} />
-              <span>{voiceFile ? voiceFile.name : "上传参考音频"}</span>
-              <small>{voiceFile ? `${voiceFile.type || "audio"} · ${formatBytes(voiceFile.size)}` : "也可以在下方当场录制"}</small>
+              <span>{voiceFile ? voiceFile.name : "上传参考音频（可选）"}</span>
+              <small>{voiceFile ? `${voiceFile.type || "audio"} · ${formatBytes(voiceFile.size)}` : "不上传时，将使用音色创造节点生成每段音频"}</small>
             </label>
             <div className="recording-panel nodrag">
               <button className={isRecording ? "record-button recording" : "record-button"} type="button" onClick={() => void startRecording()} disabled={isRecording || isGenerating}>
@@ -1301,7 +1305,11 @@ function VoiceCloneNode({ id, data }: NodeProps<StudioNode>) {
 function VoiceDesignNode({ id, data }: NodeProps<StudioNode>) {
   return (
     <StudioNodeFrame id={id} data={data} icon={<Sparkles size={17} />} tone="design">
+      <Handle type="target" position={Position.Left} id="text" className="node-handle handle-text" />
       <Handle type="source" position={Position.Right} id="output" className="node-handle" />
+      <div className="input-map input-map-design">
+        <span>文本</span>
+      </div>
       <label className="node-field nodrag">
         <span>音色描述</span>
         <textarea value={data.instruction ?? ""} onChange={(event) => data.onPatch?.(id, { instruction: event.target.value })} rows={5} />
@@ -1313,7 +1321,7 @@ function VoiceDesignNode({ id, data }: NodeProps<StudioNode>) {
       {data.error ? <p className="node-error">{data.error}</p> : null}
       <button className="run-button nodrag" type="button" onClick={() => data.onRunVoiceDesign?.(id)} disabled={data.isRunning}>
         {data.isRunning ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-        {data.isRunning ? "生成中" : "运行音色创造"}
+        {data.isRunning ? "生成中" : "批量运行音色创造"}
       </button>
     </StudioNodeFrame>
   );
@@ -1647,8 +1655,19 @@ function resolveCloneInputs(cloneNode: StudioNode, nodes: StudioNode[], edges: S
   };
 }
 
-function createArtifactNode(sourceNode: StudioNode, result: DebugResponse): StudioNode {
-  const artifactTitle = `产物 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+function resolveVoiceDesignInputs(designNode: StudioNode, nodes: StudioNode[], edges: StudioEdge[]) {
+  return edges
+    .filter((edge) => edge.target === designNode.id && edge.targetHandle === "text")
+    .map((edge) => nodes.find((node) => node.id === edge.source && node.type === "prompt"))
+    .filter((node): node is StudioNode => Boolean(node))
+    .map((node) => ({
+      title: node.data.title,
+      text: String(node.data.text || "")
+    }));
+}
+
+function createArtifactNode(sourceNode: StudioNode, result: DebugResponse, title?: string): StudioNode {
+  const artifactTitle = title?.trim() ? `${title.trim()} 产物` : `产物 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
 
   return {
     id: createId("artifact"),
