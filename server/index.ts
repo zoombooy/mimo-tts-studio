@@ -41,6 +41,14 @@ type MimoPayload = {
   };
 };
 
+type MimoVoiceDesignPayload = {
+  model: "mimo-v2.5-tts-voicedesign";
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  audio: {
+    format: "wav";
+  };
+};
+
 type MimoChatPayload = {
   model: string;
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
@@ -61,6 +69,17 @@ type MimoResponse = {
 
 type VoiceStyleOptimizePayload = {
   style: string;
+};
+
+type VoiceDesignOptimizePayload = {
+  voiceDescription: string;
+};
+
+type VoiceDesignPayload = {
+  voiceDescription: string;
+  text: string;
+  instruction?: string;
+  format?: string;
 };
 
 type SmartWorkspacePlan = {
@@ -162,6 +181,92 @@ app.post("/api/voice-style/optimize", async (req: Request<unknown, unknown, Voic
     if (!upstreamResponse.ok) {
       return res.status(upstreamResponse.status).json({
         error: "MiMo style optimization request failed.",
+        status: upstreamResponse.status,
+        elapsedMs,
+        details: parsed ?? responseText
+      });
+    }
+
+    const optimizedText = extractMessageContent(parsed);
+    if (!optimizedText) {
+      return res.status(502).json({
+        error: "MiMo response did not include choices[0].message.content.",
+        elapsedMs,
+        details: parsed
+      });
+    }
+
+    res.json({
+      optimizedText: optimizedText.trim(),
+      elapsedMs
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/voice-design/optimize", async (req: Request<unknown, unknown, VoiceDesignOptimizePayload>, res, next) => {
+  const startedAt = Date.now();
+
+  try {
+    const apiKey = process.env.MIMO_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error: "MIMO_API_KEY is not configured. Copy .env.example to .env and set your key."
+      });
+    }
+
+    const voiceDescription = String(req.body?.voiceDescription || "").trim();
+    if (!voiceDescription) {
+      return res.status(400).json({ error: "Voice design description is required." });
+    }
+
+    const payload: MimoChatPayload = {
+      model: "mimo-v2.5-pro",
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是专业的 TTS 音色设计提示词编辑。你的任务是把用户粗略的音色描述润色为适合 mimo-v2.5-tts-voicedesign 模型的 voice design prompt。只输出润色后的音色描述，不要解释，不要使用 Markdown。"
+        },
+        {
+          role: "user",
+          content: [
+            "请润色下面的音色描述，使其更适合用文本设计音色进行语音合成。",
+            "",
+            "要求：",
+            "1. 输出 1 到 4 句中文，清晰描述核心音色特征，不要过长。",
+            "2. 优先补全这些维度：性别与年龄、声音质感、情绪/语气、语速/节奏。",
+            "3. 可适度加入角色身份、说话风格、使用场景或时代质感，但不要堆砌。",
+            "4. 避免互相矛盾的要求，例如童稚声音和强烈 CEO 气场同时出现。",
+            "5. 不要使用混响、回声、EQ、压缩、母带等后期制作或音频工程术语。",
+            "6. 避免“普通、正常、外国”等缺少具体参考的模糊词。",
+            "7. 保留用户原本想要的音色方向，不要改成完全不同的声音。",
+            "",
+            `用户原文：${voiceDescription}`
+          ].join("\n")
+        }
+      ],
+      temperature: 0.45,
+      top_p: 0.9
+    };
+
+    const upstreamResponse = await fetch(mimoEndpoint, {
+      method: "POST",
+      headers: {
+        "api-key": apiKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await upstreamResponse.text();
+    const elapsedMs = Date.now() - startedAt;
+    const parsed = parseJson(responseText);
+
+    if (!upstreamResponse.ok) {
+      return res.status(upstreamResponse.status).json({
+        error: "MiMo voice design optimization request failed.",
         status: upstreamResponse.status,
         elapsedMs,
         details: parsed ?? responseText
@@ -410,6 +515,102 @@ app.delete("/api/workspaces/:id", async (req, res, next) => {
   }
 });
 
+app.post("/api/tts/voicedesign", async (req: Request<unknown, unknown, VoiceDesignPayload>, res, next) => {
+  const startedAt = Date.now();
+
+  try {
+    const apiKey = process.env.MIMO_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error: "MIMO_API_KEY is not configured. Copy .env.example to .env and set your key."
+      });
+    }
+
+    const voiceDescription = String(req.body?.voiceDescription || "").trim();
+    const text = String(req.body?.text || "").trim();
+    const instruction = String(req.body?.instruction || "").trim();
+    const outputFormat = String(req.body?.format || "wav").trim();
+
+    if (outputFormat !== "wav") {
+      return res.status(400).json({ error: "Only wav output is supported in this debugger." });
+    }
+
+    if (!voiceDescription) {
+      return res.status(400).json({ error: "Voice design description is required." });
+    }
+
+    if (!text) {
+      return res.status(400).json({ error: "Synthesis text is required." });
+    }
+
+    const payload: MimoVoiceDesignPayload = {
+      model: "mimo-v2.5-tts-voicedesign",
+      messages: [
+        { role: "user", content: voiceDescription },
+        { role: "assistant", content: text }
+      ],
+      audio: {
+        format: "wav"
+      }
+    };
+
+    const upstreamResponse = await fetch(mimoEndpoint, {
+      method: "POST",
+      headers: {
+        "api-key": apiKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await upstreamResponse.text();
+    const elapsedMs = Date.now() - startedAt;
+    const parsed = parseJson(responseText);
+
+    if (!upstreamResponse.ok) {
+      return res.status(upstreamResponse.status).json({
+        error: "MiMo voice design request failed.",
+        status: upstreamResponse.status,
+        elapsedMs,
+        details: parsed ?? responseText,
+        request: redactVoiceDesignPayload(payload)
+      });
+    }
+
+    if (!parsed) {
+      return res.status(502).json({
+        error: "MiMo API returned a non-JSON response.",
+        elapsedMs,
+        details: responseText.slice(0, 1000),
+        request: redactVoiceDesignPayload(payload)
+      });
+    }
+
+    const audioData = extractAudioData(parsed);
+    if (!audioData) {
+      return res.status(502).json({
+        error: "MiMo API response did not include choices[0].message.audio.data.",
+        elapsedMs,
+        details: parsed,
+        request: redactVoiceDesignPayload(payload)
+      });
+    }
+
+    res.json({
+      audioDataUrl: `data:audio/wav;base64,${audioData}`,
+      fileName: `mimo-voicedesign-${new Date().toISOString().replace(/[:.]/g, "-")}.wav`,
+      elapsedMs,
+      request: redactVoiceDesignPayload(payload),
+      response: {
+        audioBytesApprox: Math.floor((audioData.length * 3) / 4),
+        choiceCount: getChoiceCount(parsed)
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/tts/voiceclone", upload.single("voice"), async (req: Request, res: Response, next: NextFunction) => {
   const startedAt = Date.now();
 
@@ -629,6 +830,10 @@ function redactPayload(payload: MimoPayload, file: Express.Multer.File) {
       voice: `data:${resolveVoiceMimeType(file) ?? file.mimetype};base64,<${formatBytes(file.size)} reference audio omitted>`
     }
   };
+}
+
+function redactVoiceDesignPayload(payload: MimoVoiceDesignPayload) {
+  return payload;
 }
 
 function formatBytes(bytes: number): string {

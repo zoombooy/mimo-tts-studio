@@ -76,7 +76,7 @@ type WorkspacesResponse = {
   workspaces: WorkspaceSummary[];
 };
 
-type StudioNodeType = "referenceAudio" | "voiceStyle" | "prompt" | "voiceClone" | "artifact";
+type StudioNodeType = "referenceAudio" | "voiceStyle" | "prompt" | "voiceClone" | "voiceDesign" | "artifact";
 type StudioNode = Node<NodeData, StudioNodeType>;
 type StudioEdge = Edge<{ onDeleteEdge?: (edgeId: string) => void }>;
 
@@ -110,7 +110,9 @@ type NodeData = {
   onPatch?: (nodeId: string, patch: Partial<NodeData>) => void;
   onDelete?: (nodeId: string) => void;
   onRunClone?: (nodeId: string) => void;
+  onRunVoiceDesign?: (nodeId: string) => void;
   onOptimizeStyle?: (nodeId: string) => void;
+  onOptimizeVoiceDesign?: (nodeId: string) => void;
   onStashArtifact?: (artifact: ArtifactData) => void;
   isArtifactStashed?: (artifact: ArtifactData) => boolean;
 };
@@ -157,6 +159,15 @@ const nodeCatalog: Record<
       title: "音频克隆",
       instruction: "自然、清晰、略带播客讲述感，语速中等，语气友好但不过分夸张。",
       text: "今天我们完成了铸光音频工作站的第一条生成链路，现在用这段声音检查相似度、节奏和情绪表现。"
+    })
+  },
+  voiceDesign: {
+    label: "音色创造",
+    description: "用文字设计音色并直接合成音频",
+    defaultData: () => ({
+      title: "音色创造",
+      instruction: "年轻女性声音，温暖、清澈，带一点自然的纪录片旁白质感，情绪克制但有亲近感。",
+      text: "这是一段使用文字设计音色直接生成的语音，用来验证音色、情绪和表达质感。"
     })
   },
   artifact: {
@@ -224,7 +235,9 @@ function StudioApp() {
       onPatch: patchNode,
       onDelete: deleteNode,
       onRunClone: runVoiceClone,
+      onRunVoiceDesign: runVoiceDesign,
       onOptimizeStyle: optimizeVoiceStyle,
+      onOptimizeVoiceDesign: optimizeVoiceDesign,
       onStashArtifact: stashArtifact,
       isArtifactStashed
     }),
@@ -258,6 +271,7 @@ function StudioApp() {
       voiceStyle: VoiceStyleNode,
       prompt: PromptNode,
       voiceClone: VoiceCloneNode,
+      voiceDesign: VoiceDesignNode,
       artifact: ArtifactNode
     }),
     []
@@ -525,6 +539,69 @@ function StudioApp() {
     }
   }
 
+  async function runVoiceDesign(nodeId: string) {
+    const designNode = nodes.find((node) => node.id === nodeId);
+    if (!designNode || designNode.type !== "voiceDesign") {
+      return;
+    }
+
+    if (!status?.apiKeyConfigured) {
+      patchNode(nodeId, { error: "API Key 未配置，请先配置 .env 中的 MIMO_API_KEY。" });
+      return;
+    }
+
+    const voiceDescription = String(designNode.data.instruction || "").trim();
+    const text = String(designNode.data.text || "").trim();
+
+    if (!voiceDescription) {
+      patchNode(nodeId, { error: "请先填写音色描述。" });
+      return;
+    }
+
+    if (!text) {
+      patchNode(nodeId, { error: "请先填写音频文本。" });
+      return;
+    }
+
+    patchNode(nodeId, { isRunning: true, error: undefined });
+
+    try {
+      const response = await fetch("/api/tts/voicedesign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          voiceDescription,
+          instruction: voiceDescription,
+          text,
+          format: "wav"
+        })
+      });
+      const payload = (await response.json()) as DebugResponse & { error?: string; details?: unknown };
+
+      if (!response.ok) {
+        patchNode(nodeId, { isRunning: false, error: payload.error || "MiMo 音色创造失败。" });
+        return;
+      }
+
+      const artifactNode = createArtifactNode(designNode, payload);
+      const artifactEdge: StudioEdge = {
+        id: createId("edge"),
+        source: designNode.id,
+        sourceHandle: "output",
+        target: artifactNode.id,
+        targetHandle: "artifact",
+        type: "deletable",
+        animated: true,
+        style: { stroke: "#c5a45d", strokeWidth: 2 }
+      };
+
+      setNodes((items) => items.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, isRunning: false, error: undefined } } : node)).concat(artifactNode));
+      setEdges((items) => items.concat(artifactEdge));
+    } catch (error) {
+      patchNode(nodeId, { isRunning: false, error: error instanceof Error ? error.message : "请求失败。" });
+    }
+  }
+
   async function optimizeVoiceStyle(nodeId: string) {
     const styleNode = nodes.find((node) => node.id === nodeId);
     if (!styleNode || styleNode.type !== "voiceStyle") {
@@ -566,6 +643,51 @@ function StudioApp() {
       patchNode(nodeId, {
         isRunning: false,
         error: error instanceof Error ? error.message : "AI 优化请求失败。"
+      });
+    }
+  }
+
+  async function optimizeVoiceDesign(nodeId: string) {
+    const designNode = nodes.find((node) => node.id === nodeId);
+    if (!designNode || designNode.type !== "voiceDesign") {
+      return;
+    }
+
+    if (!status?.apiKeyConfigured) {
+      patchNode(nodeId, { error: "API Key 未配置，请先配置 .env 中的 MIMO_API_KEY。" });
+      return;
+    }
+
+    const voiceDescription = String(designNode.data.instruction || "").trim();
+    if (!voiceDescription) {
+      patchNode(nodeId, { error: "请先填写需要润色的音色描述。" });
+      return;
+    }
+
+    patchNode(nodeId, { isRunning: true, error: undefined });
+
+    try {
+      const response = await fetch("/api/voice-design/optimize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voiceDescription })
+      });
+      const payload = (await response.json()) as StyleOptimizeResponse;
+
+      if (!response.ok) {
+        patchNode(nodeId, { isRunning: false, error: payload.error || "AI 润色音色描述失败。" });
+        return;
+      }
+
+      patchNode(nodeId, {
+        instruction: payload.optimizedText,
+        isRunning: false,
+        error: undefined
+      });
+    } catch (error) {
+      patchNode(nodeId, {
+        isRunning: false,
+        error: error instanceof Error ? error.message : "AI 润色音色描述请求失败。"
       });
     }
   }
@@ -1176,6 +1298,27 @@ function VoiceCloneNode({ id, data }: NodeProps<StudioNode>) {
   );
 }
 
+function VoiceDesignNode({ id, data }: NodeProps<StudioNode>) {
+  return (
+    <StudioNodeFrame id={id} data={data} icon={<Sparkles size={17} />} tone="design">
+      <Handle type="source" position={Position.Right} id="output" className="node-handle" />
+      <label className="node-field nodrag">
+        <span>音色描述</span>
+        <textarea value={data.instruction ?? ""} onChange={(event) => data.onPatch?.(id, { instruction: event.target.value })} rows={5} />
+      </label>
+      <label className="node-field nodrag">
+        <span>音频文本</span>
+        <textarea value={data.text ?? ""} onChange={(event) => data.onPatch?.(id, { text: event.target.value })} rows={6} />
+      </label>
+      {data.error ? <p className="node-error">{data.error}</p> : null}
+      <button className="run-button nodrag" type="button" onClick={() => data.onRunVoiceDesign?.(id)} disabled={data.isRunning}>
+        {data.isRunning ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
+        {data.isRunning ? "生成中" : "运行音色创造"}
+      </button>
+    </StudioNodeFrame>
+  );
+}
+
 function ArtifactNode({ id, data }: NodeProps<StudioNode>) {
   const artifact = data.artifact;
   const isStashed = artifact ? data.isArtifactStashed?.(artifact) : false;
@@ -1240,13 +1383,13 @@ function StudioNodeFrame({
           />
         </div>
         <div className="node-header-actions">
-          {tone === "style" ? (
+          {tone === "style" || tone === "design" ? (
             <button
               className="icon-button optimize-icon nodrag"
               type="button"
-              onClick={() => data.onOptimizeStyle?.(id)}
+              onClick={() => (tone === "style" ? data.onOptimizeStyle?.(id) : data.onOptimizeVoiceDesign?.(id))}
               disabled={data.isRunning}
-              title={data.isRunning ? "AI优化中" : "AI优化语音风格"}
+              title={data.isRunning ? "AI优化中" : tone === "style" ? "AI优化语音风格" : "AI润色音色描述"}
             >
               {data.isRunning ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
             </button>
@@ -1528,7 +1671,7 @@ function createArtifactNode(sourceNode: StudioNode, result: DebugResponse): Stud
 }
 
 function stripNodeCallbacks(node: StudioNode): StudioNode {
-  const { onPatch, onDelete, onRunClone, onOptimizeStyle, onStashArtifact, isArtifactStashed, ...data } = node.data;
+  const { onPatch, onDelete, onRunClone, onRunVoiceDesign, onOptimizeStyle, onOptimizeVoiceDesign, onStashArtifact, isArtifactStashed, ...data } = node.data;
   return { ...node, data };
 }
 

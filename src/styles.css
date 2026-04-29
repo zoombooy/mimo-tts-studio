@@ -515,6 +515,14 @@ a.stash-round-action:hover {
   border-color: rgba(197, 164, 93, 0.75);
 }
 
+.node-design {
+  width: 370px;
+  border-color: rgba(173, 188, 255, 0.62);
+  background:
+    linear-gradient(180deg, rgba(33, 37, 55, 0.96), rgba(15, 15, 13, 0.98)),
+    #11100e;
+}
+
 .node-artifact {
   border-color: rgba(236, 198, 112, 0.9);
 }
