@@ -41,6 +41,13 @@ type MimoPayload = {
   };
 };
 
+type MimoChatPayload = {
+  model: string;
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  temperature?: number;
+  top_p?: number;
+};
+
 type MimoResponse = {
   choices?: Array<{
     message?: {
@@ -54,6 +61,17 @@ type MimoResponse = {
 
 type VoiceStyleOptimizePayload = {
   style: string;
+};
+
+type SmartWorkspacePlan = {
+  workspaceName?: unknown;
+  segments?: unknown;
+};
+
+type SmartWorkspaceSegment = {
+  index: number;
+  title: string;
+  directorText: string;
 };
 
 type StoredWorkspace = {
@@ -216,6 +234,127 @@ app.post("/api/workspaces", async (req, res, next) => {
       stashItems: Array.isArray(req.body?.stashItems) ? req.body.stashItems : [],
       viewport: req.body?.viewport
     };
+
+    store.workspaces.unshift(workspace);
+    store.activeWorkspaceId = workspace.id;
+    await writeWorkspaceStore(store);
+    res.status(201).json(workspace);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/workspaces/smart", upload.single("voice"), async (req: Request, res: Response, next: NextFunction) => {
+  const startedAt = Date.now();
+
+  try {
+    const sceneDescription = String(req.body?.sceneDescription || "").trim();
+    const script = String(req.body?.script || "").trim();
+    const scriptSegments = splitScriptSegments(script);
+
+    if (!req.file) {
+      return res.status(400).json({ error: "Reference audio is required." });
+    }
+
+    const voiceMime = resolveVoiceMimeType(req.file);
+    if (!voiceMime) {
+      return res.status(400).json({
+        error: "Unsupported audio type. Please upload an mp3, m4a/mp4 audio, or wav file.",
+        receivedMimeType: req.file.mimetype,
+        fileName: req.file.originalname
+      });
+    }
+
+    if (!sceneDescription) {
+      return res.status(400).json({ error: "Scene description is required." });
+    }
+
+    if (scriptSegments.length === 0) {
+      return res.status(400).json({ error: "Script must include at least one paragraph. Use ---- to separate paragraphs." });
+    }
+
+    const apiKey = process.env.MIMO_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error: "MIMO_API_KEY is not configured. Copy .env.example to .env and set your key."
+      });
+    }
+
+    const payload: MimoChatPayload = {
+      model: "mimo-v2.5-pro",
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是专业的中文有声内容导演和工作流策划助手。你只根据用户给出的整体场景描述和逐段台词，为每段生成短标题和适合语音克隆 TTS 的语音风格文本。语音风格文本主要描述整体氛围、情绪、角色状态和表达质感，不要写具体台词的停顿、重音或逐句朗读指令。必须输出严格 JSON，不要使用 Markdown，不要输出解释。"
+        },
+        {
+          role: "user",
+          content: buildSmartWorkspacePrompt(sceneDescription, scriptSegments)
+        }
+      ],
+      temperature: 0.35,
+      top_p: 0.9
+    };
+
+    const upstreamResponse = await fetch(mimoEndpoint, {
+      method: "POST",
+      headers: {
+        "api-key": apiKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await upstreamResponse.text();
+    const elapsedMs = Date.now() - startedAt;
+    const parsed = parseJson(responseText);
+
+    if (!upstreamResponse.ok) {
+      return res.status(upstreamResponse.status).json({
+        error: "MiMo smart workspace request failed.",
+        status: upstreamResponse.status,
+        elapsedMs,
+        details: parsed ?? responseText
+      });
+    }
+
+    const content = extractMessageContent(parsed);
+    if (!content) {
+      return res.status(502).json({
+        error: "MiMo response did not include choices[0].message.content.",
+        elapsedMs,
+        details: parsed
+      });
+    }
+
+    const plan = parseSmartWorkspacePlan(content);
+    if (!plan) {
+      return res.status(502).json({
+        error: "MiMo response was not valid smart workspace JSON.",
+        elapsedMs,
+        details: content
+      });
+    }
+
+    const segments = normalizeSmartWorkspaceSegments(plan, scriptSegments.length);
+    if (!segments) {
+      return res.status(502).json({
+        error: "MiMo smart workspace segment count did not match the script paragraphs.",
+        expected: scriptSegments.length,
+        details: plan
+      });
+    }
+
+    const store = await readWorkspaceStore();
+    const workspace = createSmartWorkspace({
+      workspaceName: normalizeWorkspaceName(plan.workspaceName || `智能画板 ${new Date().toLocaleString("zh-CN", { hour12: false })}`),
+      sceneDescription,
+      scriptSegments,
+      segments,
+      file: req.file,
+      voiceMime
+    });
 
     store.workspaces.unshift(workspace);
     store.activeWorkspaceId = workspace.id;
@@ -495,6 +634,183 @@ function redactPayload(payload: MimoPayload, file: Express.Multer.File) {
 function formatBytes(bytes: number): string {
   const mb = bytes / 1024 / 1024;
   return `${mb.toFixed(1)} MB`;
+}
+
+function splitScriptSegments(script: string): string[] {
+  return script
+    .split(/\n?\s*----\s*\n?/g)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildSmartWorkspacePrompt(sceneDescription: string, scriptSegments: string[]): string {
+  return [
+    "请为下面的有声内容台词生成智能画板分段规划。",
+    "",
+    "整体场景描述：",
+    sceneDescription,
+    "",
+    "分段台词：",
+    scriptSegments.map((segment, index) => `第 ${index + 1} 段：\n${segment}`).join("\n\n"),
+    "",
+    "输出要求：",
+    "1. 只输出严格 JSON，不要 Markdown，不要代码块，不要解释。",
+    "2. 不要改写台词正文；你只负责生成 workspaceName、每段 title 和 directorText。",
+    "3. segments 数量必须与分段台词数量完全一致，index 从 1 开始连续递增。",
+    "4. 每段 directorText 必须主要描述整体氛围、情绪基调、角色心理状态、表达质感和表演意图。",
+    "5. directorText 不要引用具体台词，不要写“在某句话后停顿”“重音放在某个词上”这类逐句朗读指令。",
+    "6. directorText 可以描述整体语速和语气，但不要包含具体停顿位置、具体重音位置或逐字逐句的读法。",
+    "7. title 应简短，适合用作画板节点名称。",
+    "",
+    "JSON 结构必须是：",
+    '{"workspaceName":"string","segments":[{"index":1,"title":"string","directorText":"string"}]}'
+  ].join("\n");
+}
+
+function parseSmartWorkspacePlan(content: string): SmartWorkspacePlan | null {
+  const trimmed = content.trim();
+  const candidates = [
+    trimmed,
+    trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, ""),
+    trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1)
+  ].filter((value) => value.trim().startsWith("{") && value.trim().endsWith("}"));
+
+  for (const candidate of candidates) {
+    const parsed = parseJson(candidate);
+    if (parsed && typeof parsed === "object") {
+      return parsed as SmartWorkspacePlan;
+    }
+  }
+
+  return null;
+}
+
+function normalizeSmartWorkspaceSegments(plan: SmartWorkspacePlan, expectedCount: number): SmartWorkspaceSegment[] | null {
+  if (!Array.isArray(plan.segments) || plan.segments.length !== expectedCount) {
+    return null;
+  }
+
+  const segments = plan.segments.map((item, index) => {
+    const segment = item as { index?: unknown; title?: unknown; directorText?: unknown };
+    const segmentIndex = Number(segment.index);
+    return {
+      index: Number.isFinite(segmentIndex) ? segmentIndex : index + 1,
+      title: String(segment.title || `第 ${index + 1} 段`).trim(),
+      directorText: String(segment.directorText || "").trim()
+    };
+  });
+
+  if (segments.some((segment, index) => segment.index !== index + 1 || !segment.title || !segment.directorText)) {
+    return null;
+  }
+
+  return segments;
+}
+
+function createSmartWorkspace({
+  workspaceName,
+  scriptSegments,
+  segments,
+  file,
+  voiceMime
+}: {
+  workspaceName: string;
+  sceneDescription: string;
+  scriptSegments: string[];
+  segments: SmartWorkspaceSegment[];
+  file: Express.Multer.File;
+  voiceMime: "audio/mp3" | "audio/m4a" | "audio/wav";
+}): StoredWorkspace {
+  const now = new Date().toISOString();
+  const workspaceId = createId("board");
+  const referenceNodeId = createId("referenceAudio");
+  const audioDataUrl = `data:${voiceMime};base64,${file.buffer.toString("base64")}`;
+  const nodes: unknown[] = [
+    {
+      id: referenceNodeId,
+      type: "referenceAudio",
+      position: { x: 40, y: 80 },
+      data: {
+        title: "参考音频",
+        text: "声音样本",
+        audio: {
+          fileName: file.originalname,
+          mimeType: voiceMime,
+          size: file.size,
+          dataUrl: audioDataUrl
+        }
+      }
+    }
+  ];
+  const edges: unknown[] = [];
+
+  segments.forEach((segment, index) => {
+    const y = 80 + index * 300;
+    const styleNodeId = createId("voiceStyle");
+    const promptNodeId = createId("prompt");
+    const cloneNodeId = createId("voiceClone");
+    const segmentTitle = segment.title || `第 ${index + 1} 段`;
+
+    nodes.push(
+      {
+        id: styleNodeId,
+        type: "voiceStyle",
+        position: { x: 400, y },
+        data: {
+          title: `${segmentTitle} 导演`,
+          text: segment.directorText
+        }
+      },
+      {
+        id: promptNodeId,
+        type: "prompt",
+        position: { x: 400, y: y + 150 },
+        data: {
+          title: `${segmentTitle} 台词`,
+          text: scriptSegments[index]
+        }
+      },
+      {
+        id: cloneNodeId,
+        type: "voiceClone",
+        position: { x: 820, y: y + 60 },
+        data: {
+          title: `${segmentTitle} 克隆`,
+          instruction: segment.directorText,
+          text: scriptSegments[index]
+        }
+      }
+    );
+
+    edges.push(
+      createWorkflowEdge(referenceNodeId, "audio", cloneNodeId, "voice"),
+      createWorkflowEdge(styleNodeId, "style", cloneNodeId, "instruction"),
+      createWorkflowEdge(promptNodeId, "text", cloneNodeId, "text")
+    );
+  });
+
+  return {
+    id: workspaceId,
+    name: workspaceName,
+    createdAt: now,
+    updatedAt: now,
+    nodes,
+    edges,
+    stashItems: []
+  };
+}
+
+function createWorkflowEdge(source: string, sourceHandle: string, target: string, targetHandle: string) {
+  return {
+    id: createId("edge"),
+    source,
+    sourceHandle,
+    target,
+    targetHandle,
+    type: "deletable",
+    animated: true,
+    style: { stroke: "#c5a45d", strokeWidth: 2 }
+  };
 }
 
 async function readWorkspaceStore(): Promise<WorkspaceStore> {

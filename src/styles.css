@@ -164,6 +164,94 @@ h1 {
   z-index: 4;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.64);
+  backdrop-filter: blur(6px);
+}
+
+.board-modal {
+  width: min(720px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border: 1px solid rgba(197, 164, 93, 0.42);
+  border-radius: 8px;
+  background: rgba(13, 13, 11, 0.98);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+  padding: 16px;
+}
+
+.modal-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+.modal-header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.modal-header strong {
+  color: #f5ecd4;
+  font-size: 18px;
+}
+
+.modal-header span,
+.create-choice-grid small {
+  color: #9f947b;
+  font-size: 12px;
+}
+
+.create-choice-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.create-choice-grid button {
+  min-height: 132px;
+  align-items: flex-start;
+  flex-direction: column;
+  padding: 16px;
+  text-align: left;
+}
+
+.create-choice-grid span {
+  color: #f2dfae;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.smart-board-form {
+  display: grid;
+  gap: 10px;
+}
+
+.smart-board-form .studio-player {
+  margin-top: 0;
+}
+
+.modal-actions {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.modal-actions .run-button {
+  margin-top: 0;
+}
+
 .studio-layout {
   flex: 1;
   min-height: 0;

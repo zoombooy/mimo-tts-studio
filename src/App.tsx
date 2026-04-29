@@ -189,6 +189,7 @@ function StudioApp() {
   const [menu, setMenu] = useState<{ x: number; y: number; flowX: number; flowY: number } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isStashOpen, setIsStashOpen] = useState(false);
+  const [boardDialog, setBoardDialog] = useState<"choice" | "smart" | null>(null);
   const flowRef = useRef<ReactFlowInstance<StudioNode, StudioEdge> | null>(null);
   const saveTimerRef = useRef<number | null>(null);
 
@@ -315,6 +316,18 @@ function StudioApp() {
       body: JSON.stringify({ name, nodes: [], edges: [], stashItems: [] })
     });
     const workspace = (await response.json()) as WorkspacePayload;
+    await loadWorkspaceList(workspace.id);
+  }
+
+  async function createSmartWorkspace(formData: FormData) {
+    const response = await fetch("/api/workspaces/smart", {
+      method: "POST",
+      body: formData
+    });
+    const workspace = (await response.json()) as WorkspacePayload & { error?: string };
+    if (!response.ok) {
+      throw new Error(workspace.error || `智能画板生成失败：HTTP ${response.status}`);
+    }
     await loadWorkspaceList(workspace.id);
   }
 
@@ -608,7 +621,7 @@ function StudioApp() {
             <PanelTop size={17} />
             <span>画板库</span>
           </div>
-          <button className="new-board" type="button" onClick={() => void createWorkspace()}>
+          <button className="new-board" type="button" onClick={() => setBoardDialog("choice")}>
             <Plus size={16} />
             新建画板
           </button>
@@ -676,7 +689,261 @@ function StudioApp() {
           </div>
         </section>
       </section>
+      {boardDialog ? (
+        <BoardCreateDialog
+          mode={boardDialog}
+          onClose={() => setBoardDialog(null)}
+          onCreateBlank={() => {
+            setBoardDialog(null);
+            void createWorkspace();
+          }}
+          onCreateSmart={createSmartWorkspace}
+          onSwitchMode={setBoardDialog}
+        />
+      ) : null}
     </main>
+  );
+}
+
+function BoardCreateDialog({
+  mode,
+  onClose,
+  onCreateBlank,
+  onCreateSmart,
+  onSwitchMode
+}: {
+  mode: "choice" | "smart";
+  onClose: () => void;
+  onCreateBlank: () => void;
+  onCreateSmart: (formData: FormData) => Promise<void>;
+  onSwitchMode: (mode: "choice" | "smart") => void;
+}) {
+  const [voiceFile, setVoiceFile] = useState<File | null>(null);
+  const [voicePreviewUrl, setVoicePreviewUrl] = useState<string | null>(null);
+  const [sceneDescription, setSceneDescription] = useState("");
+  const [script, setScript] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<BlobPart[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      stopRecordingTimer();
+      stopRecordingStream();
+    };
+  }, []);
+
+  async function setSmartVoiceFile(file: File) {
+    if (!allowedAudioTypes.has(file.type) && !/\.(mp3|m4a|mp4|wav)$/i.test(file.name)) {
+      setError("仅支持 mp3、m4a/mp4 或 wav 参考音频。");
+      return;
+    }
+
+    if (file.size > maxAudioBytes) {
+      setError(`参考音频不能超过 ${formatBytes(maxAudioBytes)}。`);
+      return;
+    }
+
+    setVoiceFile(file);
+    setVoicePreviewUrl(await blobToDataUrl(file));
+    setError(null);
+  }
+
+  function onFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) {
+      void setSmartVoiceFile(file);
+    }
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setError("当前浏览器不支持录音，请改用上传音频文件。");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = getSupportedRecordingMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+
+      recordingChunksRef.current = [];
+      recordingStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      setRecordingSeconds(0);
+      setIsRecording(true);
+      setError(null);
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordingChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        void commitRecording(recorder.mimeType || mimeType || "audio/webm");
+      };
+      recorder.start();
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingSeconds((value) => value + 1);
+      }, 1000);
+    } catch (recordingError) {
+      stopRecordingStream();
+      setIsRecording(false);
+      setError(recordingError instanceof Error ? recordingError.message : "录音启动失败。");
+    }
+  }
+
+  function stopRecording() {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+    setIsRecording(false);
+    stopRecordingTimer();
+  }
+
+  async function commitRecording(mimeType: string) {
+    const chunks = recordingChunksRef.current;
+    recordingChunksRef.current = [];
+    stopRecordingStream();
+
+    if (chunks.length === 0) {
+      setError("没有录到有效音频。");
+      return;
+    }
+
+    try {
+      const recordedBlob = new Blob(chunks, { type: mimeType });
+      const wavBlob = await convertRecordedBlobToWav(recordedBlob);
+      const fileName = `smart-reference-${formatDateForFile(new Date())}.wav`;
+      const file = new File([wavBlob], fileName, { type: "audio/wav" });
+      await setSmartVoiceFile(file);
+    } catch (recordingError) {
+      setError(recordingError instanceof Error ? recordingError.message : "录音处理失败。");
+    }
+  }
+
+  function stopRecordingTimer() {
+    if (recordingTimerRef.current) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  }
+
+  function stopRecordingStream() {
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
+    mediaRecorderRef.current = null;
+  }
+
+  async function submitSmartWorkspace() {
+    const paragraphs = splitScriptInput(script);
+    if (!voiceFile) {
+      setError("请上传或录制参考音频。");
+      return;
+    }
+    if (!sceneDescription.trim()) {
+      setError("请填写场景描述。");
+      return;
+    }
+    if (paragraphs.length === 0) {
+      setError("请填写台词文稿，并使用 ---- 分隔独立段落。");
+      return;
+    }
+
+    setIsGenerating(true);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append("voice", voiceFile);
+      formData.append("sceneDescription", sceneDescription.trim());
+      formData.append("script", script.trim());
+      await onCreateSmart(formData);
+      onClose();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "智能画板生成失败。");
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section className="board-modal" onClick={(event) => event.stopPropagation()}>
+        <header className="modal-header">
+          <div>
+            <strong>{mode === "choice" ? "新建画板" : "智能画板"}</strong>
+            <span>{mode === "choice" ? "选择创建方式" : "根据音频、场景和文稿生成工作流"}</span>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="关闭">
+            ×
+          </button>
+        </header>
+
+        {mode === "choice" ? (
+          <div className="create-choice-grid">
+            <button type="button" onClick={onCreateBlank}>
+              <PanelTop size={18} />
+              <span>空白画板</span>
+              <small>创建一个新的空白画板</small>
+            </button>
+            <button type="button" onClick={() => onSwitchMode("smart")}>
+              <Sparkles size={18} />
+              <span>智能画板</span>
+              <small>用场景、参考音频和文稿生成分段工作流</small>
+            </button>
+          </div>
+        ) : (
+          <div className="smart-board-form">
+            <label className="file-picker nodrag">
+              <input accept="audio/*,video/mp4,.mp3,.m4a,.mp4,.wav" type="file" onChange={onFileChange} />
+              <span>{voiceFile ? voiceFile.name : "上传参考音频"}</span>
+              <small>{voiceFile ? `${voiceFile.type || "audio"} · ${formatBytes(voiceFile.size)}` : "也可以在下方当场录制"}</small>
+            </label>
+            <div className="recording-panel nodrag">
+              <button className={isRecording ? "record-button recording" : "record-button"} type="button" onClick={() => void startRecording()} disabled={isRecording || isGenerating}>
+                <Mic2 size={15} />
+                开始录制
+              </button>
+              <button className="record-stop-button" type="button" onClick={stopRecording} disabled={!isRecording || isGenerating}>
+                <Square size={13} />
+                停止
+              </button>
+              <span>{isRecording ? `录制中 ${formatTime(recordingSeconds)}` : "当场录制参考音频"}</span>
+            </div>
+            {voicePreviewUrl ? <StudioAudioPlayer src={voicePreviewUrl} /> : null}
+            <label className="node-field">
+              <span>场景描述</span>
+              <textarea value={sceneDescription} onChange={(event) => setSceneDescription(event.target.value)} rows={4} />
+            </label>
+            <label className="node-field">
+              <span>完整台词文稿</span>
+              <textarea
+                value={script}
+                onChange={(event) => setScript(event.target.value)}
+                rows={8}
+                placeholder="每段独立段落使用 ---- 分割"
+              />
+            </label>
+            {error ? <p className="node-error">{error}</p> : null}
+            <div className="modal-actions">
+              <button type="button" onClick={() => onSwitchMode("choice")} disabled={isGenerating}>
+                返回
+              </button>
+              <button className="run-button" type="button" onClick={() => void submitSmartWorkspace()} disabled={isGenerating || isRecording}>
+                {isGenerating ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
+                {isGenerating ? "生成中" : "生成智能画板"}
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -1357,6 +1624,13 @@ function blobToDataUrl(blob: Blob): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error("读取录音失败。"));
     reader.readAsDataURL(blob);
   });
+}
+
+function splitScriptInput(script: string): string[] {
+  return script
+    .split(/\n?\s*----\s*\n?/g)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function guessMimeFromName(fileName: string): string {
