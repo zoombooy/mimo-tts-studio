@@ -210,6 +210,9 @@ function StudioApp() {
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem(API_KEY_STORAGE_KEY) || DEFAULT_API_KEY);
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState(apiKey);
+  const [topbarCollapsed, setTopbarCollapsed] = useState(false);
+  const [showDefaultKeyWarning, setShowDefaultKeyWarning] = useState(true);
+  const topbarHoverTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     void loadStatus();
@@ -217,6 +220,26 @@ function StudioApp() {
     if (!localStorage.getItem(API_KEY_STORAGE_KEY)) {
       setShowApiKeyModal(true);
     }
+
+    const collapseTimer = window.setTimeout(() => {
+      setTopbarCollapsed(true);
+    }, 5000);
+
+    return () => window.clearTimeout(collapseTimer);
+  }, []);
+
+  useEffect(() => {
+    function handleMouseMove(e: globalThis.MouseEvent) {
+      if (e.clientY < 20) {
+        setTopbarCollapsed(false);
+        if (topbarHoverTimerRef.current) {
+          window.clearTimeout(topbarHoverTimerRef.current);
+        }
+      }
+    }
+
+    document.addEventListener("mousemove", handleMouseMove);
+    return () => document.removeEventListener("mousemove", handleMouseMove);
   }, []);
 
   useEffect(() => {
@@ -312,13 +335,18 @@ function StudioApp() {
     if (!trimmed) return;
     setApiKey(trimmed);
     localStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
-    setShowApiKeyModal(false);
+    closeApiKeyModal();
     void loadStatus();
   }
 
   function openApiKeyModal() {
     setApiKeyInput(apiKey);
     setShowApiKeyModal(true);
+  }
+
+  function closeApiKeyModal() {
+    setShowApiKeyModal(false);
+    topbarHoverTimerRef.current = window.setTimeout(() => setTopbarCollapsed(true), 3000);
   }
 
   async function loadWorkspaceList(preferredId?: string) {
@@ -753,7 +781,19 @@ function StudioApp() {
 
   return (
     <main className="studio-shell" onClick={() => setMenu(null)}>
-      <header className="studio-topbar">
+      <header
+        className={`studio-topbar ${topbarCollapsed ? "collapsed" : ""}`}
+        onMouseEnter={() => {
+          if (topbarHoverTimerRef.current) {
+            window.clearTimeout(topbarHoverTimerRef.current);
+          }
+        }}
+        onMouseLeave={() => {
+          if (!showApiKeyModal) {
+            topbarHoverTimerRef.current = window.setTimeout(() => setTopbarCollapsed(true), 2000);
+          }
+        }}
+      >
         <div className="brand-block">
           <span className="brand-kicker">ZHUGUANG AUDIO WORKSTATION</span>
           <h1>铸光音频工作站</h1>
@@ -767,22 +807,25 @@ function StudioApp() {
         </div>
       </header>
 
-      {apiKey === DEFAULT_API_KEY ? (
+      {apiKey === DEFAULT_API_KEY && showDefaultKeyWarning ? (
         <section className="api-warning">
           <AlertTriangle size={18} />
           <span>当前使用的是默认 API Key，不保证长期可用。请点击右上角 API Key 区域配置自己的密钥。</span>
+          <button className="api-warning-close" type="button" onClick={() => setShowDefaultKeyWarning(false)}>
+            <X size={16} />
+          </button>
         </section>
       ) : null}
 
       {showApiKeyModal && (
-        <div className="api-key-modal" onClick={() => setShowApiKeyModal(false)}>
+        <div className="api-key-modal" onClick={closeApiKeyModal}>
           <div className="api-key-modal-content" onClick={(e) => e.stopPropagation()}>
             <div className="api-key-modal-header">
               <h3>
                 <Key size={18} />
                 配置 API Key
               </h3>
-              <button className="api-key-modal-close" type="button" onClick={() => setShowApiKeyModal(false)}>
+              <button className="api-key-modal-close" type="button" onClick={closeApiKeyModal}>
                 <X size={18} />
               </button>
             </div>
@@ -810,7 +853,7 @@ function StudioApp() {
               )}
             </div>
             <div className="api-key-modal-footer">
-              <button type="button" className="api-key-btn-cancel" onClick={() => setShowApiKeyModal(false)}>
+              <button type="button" className="api-key-btn-cancel" onClick={closeApiKeyModal}>
                 取消
               </button>
               <button type="button" className="api-key-btn-save" onClick={saveApiKey}>
