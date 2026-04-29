@@ -36,6 +36,7 @@ import {
   Plus,
   Save,
   Sparkles,
+  Square,
   Trash2
 } from "lucide-react";
 import { ChangeEvent, MouseEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -565,7 +566,7 @@ function StudioApp() {
     const zip = new JSZip();
     const usedNames = new Map<string, number>();
     for (const item of items) {
-      const safeName = getUniqueFileName(sanitizeFileName(item.fileName), usedNames);
+      const safeName = getUniqueFileName(getArtifactDownloadFileName(item.sourceNodeName || item.fileName, item.fileName), usedNames);
       zip.file(safeName, dataUrlToUint8Array(item.audioDataUrl));
     }
 
@@ -681,6 +682,19 @@ function StudioApp() {
 
 function ReferenceAudioNode({ id, data }: NodeProps<StudioNode>) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(data.audio?.dataUrl ?? null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<BlobPart[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      stopRecordingTimer();
+      stopRecordingStream();
+    };
+  }, []);
 
   function onFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -715,6 +729,101 @@ function ReferenceAudioNode({ id, data }: NodeProps<StudioNode>) {
     reader.readAsDataURL(file);
   }
 
+  async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      data.onPatch?.(id, { error: "当前浏览器不支持录音，请改用上传音频文件。" });
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = getSupportedRecordingMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+
+      recordingChunksRef.current = [];
+      recordingStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      setRecordingSeconds(0);
+      setIsRecording(true);
+      data.onPatch?.(id, { error: undefined });
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordingChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        void commitRecording(recorder.mimeType || mimeType || "audio/webm");
+      };
+      recorder.start();
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingSeconds((value) => value + 1);
+      }, 1000);
+    } catch (error) {
+      stopRecordingStream();
+      setIsRecording(false);
+      data.onPatch?.(id, { error: error instanceof Error ? error.message : "录音启动失败。" });
+    }
+  }
+
+  function stopRecording() {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+    setIsRecording(false);
+    stopRecordingTimer();
+  }
+
+  async function commitRecording(mimeType: string) {
+    const chunks = recordingChunksRef.current;
+    recordingChunksRef.current = [];
+    stopRecordingStream();
+
+    if (chunks.length === 0) {
+      data.onPatch?.(id, { error: "没有录到有效音频。" });
+      return;
+    }
+
+    try {
+      const recordedBlob = new Blob(chunks, { type: mimeType });
+      const wavBlob = await convertRecordedBlobToWav(recordedBlob);
+
+      if (wavBlob.size > maxAudioBytes) {
+        data.onPatch?.(id, { error: `录音文件不能超过 ${formatBytes(maxAudioBytes)}。请缩短录制时长。` });
+        return;
+      }
+
+      const fileName = `recorded-reference-${formatDateForFile(new Date())}.wav`;
+      const dataUrl = await blobToDataUrl(wavBlob);
+      setPreviewUrl(dataUrl);
+      data.onPatch?.(id, {
+        audio: {
+          fileName,
+          mimeType: "audio/wav",
+          size: wavBlob.size,
+          dataUrl
+        },
+        error: undefined
+      });
+    } catch (error) {
+      data.onPatch?.(id, { error: error instanceof Error ? error.message : "录音处理失败。" });
+    }
+  }
+
+  function stopRecordingTimer() {
+    if (recordingTimerRef.current) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  }
+
+  function stopRecordingStream() {
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
+    mediaRecorderRef.current = null;
+  }
+
   return (
     <StudioNodeFrame id={id} data={data} icon={<FileAudio size={17} />} tone="audio">
       <Handle type="source" position={Position.Right} id="audio" className="node-handle" />
@@ -723,6 +832,17 @@ function ReferenceAudioNode({ id, data }: NodeProps<StudioNode>) {
         <span>{data.audio ? data.audio.fileName : "上传参考音频"}</span>
         <small>{data.audio ? `${data.audio.mimeType} · ${formatBytes(data.audio.size)}` : "支持改后缀的 M4A/MP4"}</small>
       </label>
+      <div className="recording-panel nodrag">
+        <button className={isRecording ? "record-button recording" : "record-button"} type="button" onClick={() => void startRecording()} disabled={isRecording}>
+          <Mic2 size={15} />
+          开始录制
+        </button>
+        <button className="record-stop-button" type="button" onClick={stopRecording} disabled={!isRecording}>
+          <Square size={13} />
+          停止
+        </button>
+        <span>{isRecording ? `录制中 ${formatTime(recordingSeconds)}` : "当场录制参考音频"}</span>
+      </div>
       {previewUrl ? <StudioAudioPlayer src={previewUrl} /> : null}
       {data.error ? <p className="node-error">{data.error}</p> : null}
     </StudioNodeFrame>
@@ -814,7 +934,7 @@ function ArtifactNode({ id, data }: NodeProps<StudioNode>) {
               <Archive size={15} />
               {isStashed ? "已暂存" : "暂存"}
             </button>
-            <a className="download-link nodrag" href={artifact.audioDataUrl} download={artifact.fileName}>
+            <a className="download-link nodrag" href={artifact.audioDataUrl} download={getArtifactDownloadFileName(data.title, artifact.fileName)}>
               <Download size={15} />
               下载
             </a>
@@ -932,7 +1052,12 @@ function StashPanel({
             <article className="stash-item" key={item.id}>
               <strong title={item.sourceNodeName || item.fileName}>{item.sourceNodeName || item.fileName}</strong>
               <StashMiniPlayer src={item.audioDataUrl} />
-              <a className="stash-round-action" href={item.audioDataUrl} download={item.fileName} title="下载暂存音频">
+              <a
+                className="stash-round-action"
+                href={item.audioDataUrl}
+                download={getArtifactDownloadFileName(item.sourceNodeName || item.fileName, item.fileName)}
+                title="下载暂存音频"
+              >
                 <Download size={13} />
               </a>
               <button className="stash-round-action nodrag" type="button" onClick={() => onDelete(item.id)} title="删除暂存">
@@ -1161,6 +1286,79 @@ function dataUrlToUint8Array(dataUrl: string): Uint8Array {
   return bytes;
 }
 
+function getSupportedRecordingMimeType(): string {
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/mpeg"];
+  return candidates.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? "";
+}
+
+async function convertRecordedBlobToWav(blob: Blob): Promise<Blob> {
+  const AudioContextConstructor = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextConstructor) {
+    throw new Error("当前浏览器无法处理录音，请改用上传音频文件。");
+  }
+
+  const audioContext = new AudioContextConstructor();
+  try {
+    const audioBuffer = await audioContext.decodeAudioData(await blob.arrayBuffer());
+    return encodeAudioBufferToWav(audioBuffer);
+  } finally {
+    await audioContext.close();
+  }
+}
+
+function encodeAudioBufferToWav(audioBuffer: AudioBuffer): Blob {
+  const channelCount = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  const frameCount = audioBuffer.length;
+  const bytesPerSample = 2;
+  const blockAlign = channelCount * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = frameCount * blockAlign;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const channels = Array.from({ length: channelCount }, (_, index) => audioBuffer.getChannelData(index));
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      const sample = Math.max(-1, Math.min(1, channels[channel][frame]));
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      offset += bytesPerSample;
+    }
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeAscii(view: DataView, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error("读取录音失败。"));
+    reader.readAsDataURL(blob);
+  });
+}
+
 function guessMimeFromName(fileName: string): string {
   if (/\.wav$/i.test(fileName)) {
     return "audio/wav";
@@ -1173,6 +1371,16 @@ function guessMimeFromName(fileName: string): string {
 
 function sanitizeFileName(value: string): string {
   return value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim() || "audio.wav";
+}
+
+function getArtifactDownloadFileName(title: string, originalFileName: string): string {
+  const safeTitle = sanitizeFileName(title).replace(/\.[a-z0-9]{1,8}$/i, "") || "audio";
+  return `${safeTitle}${getFileExtension(originalFileName)}`;
+}
+
+function getFileExtension(fileName: string): string {
+  const match = sanitizeFileName(fileName).match(/(\.[a-z0-9]{1,8})$/i);
+  return match?.[1] ?? ".wav";
 }
 
 function getUniqueFileName(fileName: string, usedNames: Map<string, number>): string {

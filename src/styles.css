@@ -520,6 +520,33 @@ a.stash-round-action:hover {
   font-size: 12px;
 }
 
+.recording-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 82px;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.recording-panel span {
+  grid-column: 1 / -1;
+  color: #9f947b;
+  font-size: 12px;
+}
+
+.record-button,
+.record-stop-button {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.record-button.recording {
+  color: #ffb5a9;
+  border-color: rgba(235, 111, 92, 0.72);
+}
+
 .node-field {
   display: grid;
   gap: 6px;
