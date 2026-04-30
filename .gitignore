@@ -1,5 +1,7 @@
 node_modules/
 dist/
+build/
+release/
 .env
 data/workspaces.json
 data/workspaces.json.*.tmp
@@ -7,3 +9,4 @@ data/workspaces.json.*.tmp
 npm-debug.log*
 *.local
 *.tsbuildinfo
+.claude/
