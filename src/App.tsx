@@ -25,6 +25,7 @@ import {
   AlertTriangle,
   Archive,
   AudioLines,
+  BookOpen,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -41,6 +42,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Wand2,
   X
 } from "lucide-react";
 import { ChangeEvent, MouseEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -58,15 +60,20 @@ type StatusResponse = {
 type WorkspaceSummary = {
   id: string;
   name: string;
+  type: "board" | "audiobook";
   createdAt: string;
   updatedAt: string;
-  nodeCount: number;
-  edgeCount: number;
-  stashCount: number;
+  nodeCount?: number;
+  edgeCount?: number;
+  stashCount?: number;
+  characterCount?: number;
+  segmentCount?: number;
+  phase?: string;
 };
 
-type WorkspacePayload = {
+type BoardWorkspacePayload = {
   id: string;
+  type: "board";
   name: string;
   createdAt: string;
   updatedAt: string;
@@ -74,6 +81,59 @@ type WorkspacePayload = {
   edges: StudioEdge[];
   stashItems: StashItem[];
 };
+
+type AudiobookCharacter = {
+  id: string;
+  name: string;
+  gender: string;
+  age: string;
+  voiceTraits: string;
+  personality: string;
+  voiceDescription: string;
+  voiceDataUrl: string | null;
+  voiceStatus: "pending" | "generating" | "ready" | "error";
+  voiceError?: string;
+};
+
+type AudiobookSegment = {
+  id: string;
+  text: string;
+  characterId: string | null;
+  characterName: string;
+  emotion: string;
+  isAutoAnnotated: boolean;
+};
+
+type AudiobookProduct = {
+  id: string;
+  segmentId: string;
+  characterId: string | null;
+  characterName: string;
+  text: string;
+  instruction: string;
+  audioDataUrl: string | null;
+  status: "pending" | "generating" | "ready" | "error";
+  error?: string;
+  elapsedMs?: number;
+  createdAt: string;
+  synthesisMethod: "voiceClone" | "voiceDesign";
+};
+
+type AudiobookWorkspacePayload = {
+  id: string;
+  type: "audiobook";
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  novelText: string;
+  characterHints: string;
+  characters: AudiobookCharacter[];
+  segments: AudiobookSegment[];
+  products: AudiobookProduct[];
+  phase: "character-creation" | "annotation" | "generation";
+};
+
+type WorkspacePayload = BoardWorkspacePayload | AudiobookWorkspacePayload;
 
 type WorkspacesResponse = {
   activeWorkspaceId: string | null;
@@ -186,7 +246,7 @@ const nodeCatalog: Record<
   }
 };
 
-const autoSaveDelayMs = 5000;
+const autoSaveDelayMs = 300000;
 const DEFAULT_API_KEY = "sk-cbpjuoes34akq38omkqz9s08s7h9dxwe7cjshz5824kskliz";
 const DEFAULT_API_ENDPOINT = "https://api.xiaomimimo.com/v1/chat/completions";
 const API_KEY_STORAGE_KEY = "mimo-api-key";
@@ -213,7 +273,7 @@ function StudioApp() {
   const [menu, setMenu] = useState<{ x: number; y: number; flowX: number; flowY: number } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isStashOpen, setIsStashOpen] = useState(false);
-  const [boardDialog, setBoardDialog] = useState<"choice" | "smart" | null>(null);
+  const [boardDialog, setBoardDialog] = useState<"choice" | "smart" | "audiobook" | null>(null);
   const flowRef = useRef<ReactFlowInstance<StudioNode, StudioEdge> | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem(API_KEY_STORAGE_KEY) || DEFAULT_API_KEY);
@@ -273,7 +333,7 @@ function StudioApp() {
       }
     };
     // 仅监听画布结构、节点数据和暂存列表变化，避免保存函数引用。
-  }, [nodes, edges, activeWorkspace?.stashItems]);
+  }, [nodes, edges, activeWorkspace?.type === "board" ? activeWorkspace.stashItems : undefined]);
 
   const nodeCallbacks = useMemo(
     () => ({
@@ -286,7 +346,7 @@ function StudioApp() {
       onStashArtifact: stashArtifact,
       isArtifactStashed
     }),
-    [nodes, edges, apiKey, activeWorkspace?.stashItems]
+    [nodes, edges, apiKey, activeWorkspace?.type === "board" ? activeWorkspace.stashItems : undefined]
   );
 
   const hydratedNodes = useMemo(() => {
@@ -391,9 +451,14 @@ function StudioApp() {
       throw new Error(`加载画板失败：HTTP ${response.status}`);
     }
     const workspace = (await response.json()) as WorkspacePayload;
-    setActiveWorkspace({ ...workspace, stashItems: workspace.stashItems ?? [] });
-    setNodes(workspace.nodes ?? []);
-    setEdges(workspace.edges ?? []);
+    setActiveWorkspace(workspace);
+    if (workspace.type === "board") {
+      setNodes(workspace.nodes ?? []);
+      setEdges(workspace.edges ?? []);
+    } else {
+      setNodes([]);
+      setEdges([]);
+    }
   }
 
   async function createWorkspace() {
@@ -420,6 +485,123 @@ function StudioApp() {
     await loadWorkspaceList(workspace.id);
   }
 
+  async function createAudiobookWorkspace(data: { novelText: string; characterHints: string; name?: string }) {
+    const response = await fetch("/api/audiobook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint },
+      body: JSON.stringify(data)
+    });
+    const workspace = (await response.json()) as AudiobookWorkspacePayload & { error?: string };
+    if (!response.ok) {
+      throw new Error(workspace.error || "创建有声书失败");
+    }
+    await loadWorkspaceList(workspace.id);
+  }
+
+  function patchAudiobook(patch: Partial<AudiobookWorkspacePayload>) {
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") return;
+    setActiveWorkspace({ ...activeWorkspace, ...patch } as AudiobookWorkspacePayload);
+  }
+
+  async function analyzeAudiobookCharacters() {
+    console.log("[analyzeCharacters] called, activeWorkspace:", activeWorkspace?.id, activeWorkspace?.type);
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
+    console.log("[analyzeCharacters] sending request to:", `/api/audiobook/${activeWorkspace.id}/characters/analyze`);
+    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/characters/analyze`, {
+      method: "POST",
+      headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
+    });
+    console.log("[analyzeCharacters] response status:", response.status);
+    const result = (await response.json()) as { characters?: AudiobookCharacter[]; error?: string };
+    if (!response.ok) {
+      throw new Error(result.error || "角色分析失败");
+    }
+    patchAudiobook({ characters: result.characters ?? [] });
+  }
+
+  async function generateCharacterVoice(charId: string) {
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") return;
+    // 乐观更新
+    patchAudiobook({
+      characters: activeWorkspace.characters.map((c) =>
+        c.id === charId ? { ...c, voiceStatus: "generating" as AudiobookCharacter["voiceStatus"], voiceError: undefined } : c
+      )
+    });
+    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/characters/${charId}/voice`, {
+      method: "POST",
+      headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
+    });
+    const result = (await response.json()) as { character?: AudiobookCharacter; error?: string };
+    if (!response.ok) {
+      patchAudiobook({
+        characters: activeWorkspace.characters.map((c) =>
+          c.id === charId ? { ...c, voiceStatus: "error" as AudiobookCharacter["voiceStatus"], voiceError: result.error || "生成失败" } : c
+        )
+      });
+      return;
+    }
+    patchAudiobook({
+      characters: activeWorkspace.characters.map((c) => (c.id === charId ? result.character! : c))
+    });
+  }
+
+  async function deleteCharacterVoice(charId: string) {
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") return;
+    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/characters/${charId}/voice`, {
+      method: "DELETE"
+    });
+    const result = (await response.json()) as { character?: AudiobookCharacter; error?: string };
+    if (!response.ok) {
+      throw new Error(result.error || "删除音色失败");
+    }
+    patchAudiobook({
+      characters: activeWorkspace.characters.map((c) => (c.id === charId ? result.character! : c))
+    });
+  }
+
+  async function autoAnnotateAudiobook() {
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
+    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/annotate`, {
+      method: "POST",
+      headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
+    });
+    const result = (await response.json()) as { segments?: AudiobookSegment[]; error?: string };
+    if (!response.ok) {
+      throw new Error(result.error || "自动标注失败");
+    }
+    patchAudiobook({ segments: result.segments ?? [], phase: "annotation" });
+  }
+
+  async function updateAudiobookSegment(segId: string, patch: { characterId: string | null; characterName: string; emotion: string }) {
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") return;
+    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/segments/${segId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch)
+    });
+    const result = (await response.json()) as { segment?: AudiobookSegment; error?: string };
+    if (!response.ok) {
+      throw new Error(result.error || "标注失败");
+    }
+    patchAudiobook({
+      segments: activeWorkspace.segments.map((s) => (s.id === segId ? result.segment! : s))
+    });
+  }
+
+  async function generateAudiobookAudio() {
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
+    patchAudiobook({ phase: "generation" });
+    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/generate`, {
+      method: "POST",
+      headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
+    });
+    const result = (await response.json()) as { products?: AudiobookProduct[]; error?: string };
+    if (!response.ok) {
+      throw new Error(result.error || "生成失败");
+    }
+    patchAudiobook({ products: result.products ?? [] });
+  }
+
   async function deleteWorkspace() {
     if (!activeWorkspace || !window.confirm(`删除「${activeWorkspace.name}」？`)) {
       return;
@@ -438,16 +620,32 @@ function StudioApp() {
     }
 
     setIsSaving(true);
-    const cleanNodes = nodes.map(stripNodeCallbacks);
-    const response = await fetch(`/api/workspaces/${activeWorkspace.id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+
+    let body: Record<string, unknown>;
+    if (activeWorkspace.type === "audiobook") {
+      body = {
+        name: activeWorkspace.name,
+        novelText: activeWorkspace.novelText,
+        characterHints: activeWorkspace.characterHints,
+        characters: activeWorkspace.characters,
+        segments: activeWorkspace.segments,
+        products: activeWorkspace.products,
+        phase: activeWorkspace.phase
+      };
+    } else {
+      const cleanNodes = nodes.map(stripNodeCallbacks);
+      body = {
         name: activeWorkspace.name,
         nodes: cleanNodes,
         edges,
         stashItems: activeWorkspace.stashItems ?? []
-      })
+      };
+    }
+
+    const response = await fetch(`/api/workspaces/${activeWorkspace.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
     });
     const saved = (await response.json()) as WorkspacePayload;
     setActiveWorkspace(saved);
@@ -457,10 +655,7 @@ function StudioApp() {
           ? {
               ...item,
               name: saved.name,
-              updatedAt: saved.updatedAt,
-              nodeCount: saved.nodes.length,
-              edgeCount: saved.edges.length,
-              stashCount: saved.stashItems.length
+              updatedAt: saved.updatedAt
             }
           : item
       )
@@ -481,23 +676,30 @@ function StudioApp() {
       id: createId("stash"),
       ...artifact
     };
-    setActiveWorkspace((workspace) => (workspace ? { ...workspace, stashItems: [item, ...(workspace.stashItems ?? [])] } : workspace));
-    setWorkspaces((items) => items.map((workspace) => (workspace.id === activeWorkspace.id ? { ...workspace, stashCount: workspace.stashCount + 1 } : workspace)));
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "board") return workspace;
+      return { ...workspace, stashItems: [item, ...workspace.stashItems] };
+    });
+    setWorkspaces((items) => items.map((w) => (w.id === activeWorkspace.id ? { ...w, stashCount: (w.stashCount ?? 0) + 1 } : w)));
   }
 
   function isArtifactStashed(artifact: ArtifactData) {
-    return Boolean(activeWorkspace?.stashItems?.some((item) => item.fileName === artifact.fileName && item.audioDataUrl === artifact.audioDataUrl));
+    if (!activeWorkspace || activeWorkspace.type !== "board") return false;
+    return activeWorkspace.stashItems.some((item) => item.fileName === artifact.fileName && item.audioDataUrl === artifact.audioDataUrl);
   }
 
   function deleteStashItem(itemId: string) {
-    if (!activeWorkspace) {
+    if (!activeWorkspace || activeWorkspace.type !== "board") {
       return;
     }
 
-    setActiveWorkspace((workspace) => (workspace ? { ...workspace, stashItems: workspace.stashItems.filter((item) => item.id !== itemId) } : workspace));
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "board") return workspace;
+      return { ...workspace, stashItems: workspace.stashItems.filter((item) => item.id !== itemId) };
+    });
     setWorkspaces((items) =>
       items.map((workspace) =>
-        workspace.id === activeWorkspace.id ? { ...workspace, stashCount: Math.max(0, workspace.stashCount - 1) } : workspace
+        workspace.id === activeWorkspace.id ? { ...workspace, stashCount: Math.max(0, (workspace.stashCount ?? 0) - 1) } : workspace
       )
     );
   }
@@ -780,10 +982,10 @@ function StudioApp() {
   }
 
   async function downloadStashZip() {
-    const items = activeWorkspace?.stashItems ?? [];
-    if (!activeWorkspace || items.length === 0) {
+    if (!activeWorkspace || activeWorkspace.type !== "board" || activeWorkspace.stashItems.length === 0) {
       return;
     }
+    const items = activeWorkspace.stashItems;
 
     const zip = new JSZip();
     const usedNames = new Map<string, number>();
@@ -933,15 +1135,20 @@ function StudioApp() {
                       type="button"
                       onClick={() => void loadWorkspace(workspace.id)}
                     >
-                      <strong>{workspace.name}</strong>
+                      <strong>
+                        {workspace.type === "audiobook" ? <BookOpen size={14} style={{ marginRight: 6, verticalAlign: "middle" }} /> : null}
+                        {workspace.name}
+                      </strong>
                       <span>
-                        {workspace.nodeCount} 节点 / {workspace.edgeCount} 连线
+                        {workspace.type === "audiobook"
+                          ? `${workspace.characterCount ?? 0} 角色 / ${workspace.segmentCount ?? 0} 段落`
+                          : `${workspace.nodeCount ?? 0} 节点 / ${workspace.edgeCount ?? 0} 连线`}
                       </span>
                     </button>
-                    {workspace.id === activeWorkspace?.id && (activeWorkspace.stashItems?.length ?? 0) > 0 ? (
+                    {workspace.id === activeWorkspace?.id && activeWorkspace.type === "board" && activeWorkspace.stashItems.length > 0 ? (
                       <StashPanel
                         isOpen={isStashOpen}
-                        items={activeWorkspace.stashItems ?? []}
+                        items={activeWorkspace.stashItems}
                         onBatchDownload={() => void downloadStashZip()}
                         onDelete={deleteStashItem}
                         onToggle={() => setIsStashOpen((value) => !value)}
@@ -958,38 +1165,53 @@ function StudioApp() {
           )}
         </aside>
 
-        <section className="canvas-panel">
-          <div className="canvas-titlebar">
-            <input
-              value={activeWorkspace?.name ?? ""}
-              onChange={(event) => patchWorkspaceName(event.target.value)}
-              onBlur={() => void saveWorkspace()}
-              placeholder="未命名工作台"
-            />
-            <span>右键画布添加节点，拖动端口建立连接</span>
-          </div>
-          <div className="flow-wrap" onContextMenu={openContextMenu}>
-            <ReactFlow<StudioNode, StudioEdge>
-              nodes={hydratedNodes}
-              edges={hydratedEdges}
-              nodeTypes={nodeTypes}
-              edgeTypes={edgeTypes}
-              onInit={(instance) => {
-                flowRef.current = instance;
-              }}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
-              fitView
-              proOptions={{ hideAttribution: true }}
-            >
-              <Background color="#3f3a2d" gap={34} size={1.2} variant={BackgroundVariant.Dots} />
-              <Controls />
-              <MiniMap pannable zoomable nodeColor="#c5a45d" maskColor="rgba(8, 8, 7, 0.72)" />
-            </ReactFlow>
-            {menu ? <ContextMenu menu={menu} onAdd={addNode} /> : null}
-          </div>
-        </section>
+        {activeWorkspace?.type === "audiobook" ? (
+          <AudiobookConsole
+            workspace={activeWorkspace}
+            apiKey={apiKey}
+            apiEndpoint={apiEndpoint}
+            onPatch={patchAudiobook}
+            onAnalyze={() => void analyzeAudiobookCharacters()}
+            onGenerateVoice={(charId) => void generateCharacterVoice(charId)}
+            onDeleteVoice={(charId) => void deleteCharacterVoice(charId)}
+            onAutoAnnotate={() => void autoAnnotateAudiobook()}
+            onUpdateSegment={(segId, patch) => void updateAudiobookSegment(segId, patch)}
+            onGenerate={() => void generateAudiobookAudio()}
+          />
+        ) : (
+          <section className="canvas-panel">
+            <div className="canvas-titlebar">
+              <input
+                value={activeWorkspace?.name ?? ""}
+                onChange={(event) => patchWorkspaceName(event.target.value)}
+                onBlur={() => void saveWorkspace()}
+                placeholder="未命名工作台"
+              />
+              <span>右键画布添加节点，拖动端口建立连接</span>
+            </div>
+            <div className="flow-wrap" onContextMenu={openContextMenu}>
+              <ReactFlow<StudioNode, StudioEdge>
+                nodes={hydratedNodes}
+                edges={hydratedEdges}
+                nodeTypes={nodeTypes}
+                edgeTypes={edgeTypes}
+                onInit={(instance) => {
+                  flowRef.current = instance;
+                }}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onConnect={onConnect}
+                fitView
+                proOptions={{ hideAttribution: true }}
+              >
+                <Background color="#3f3a2d" gap={34} size={1.2} variant={BackgroundVariant.Dots} />
+                <Controls />
+                <MiniMap pannable zoomable nodeColor="#c5a45d" maskColor="rgba(8, 8, 7, 0.72)" />
+              </ReactFlow>
+              {menu ? <ContextMenu menu={menu} onAdd={addNode} /> : null}
+            </div>
+          </section>
+        )}
       </section>
       {boardDialog ? (
         <BoardCreateDialog
@@ -1000,6 +1222,10 @@ function StudioApp() {
             void createWorkspace();
           }}
           onCreateSmart={createSmartWorkspace}
+          onCreateAudiobook={async (data) => {
+            setBoardDialog(null);
+            await createAudiobookWorkspace(data);
+          }}
           onSwitchMode={setBoardDialog}
         />
       ) : null}
@@ -1012,13 +1238,15 @@ function BoardCreateDialog({
   onClose,
   onCreateBlank,
   onCreateSmart,
+  onCreateAudiobook,
   onSwitchMode
 }: {
-  mode: "choice" | "smart";
+  mode: "choice" | "smart" | "audiobook";
   onClose: () => void;
   onCreateBlank: () => void;
   onCreateSmart: (formData: FormData) => Promise<void>;
-  onSwitchMode: (mode: "choice" | "smart") => void;
+  onCreateAudiobook: (data: { novelText: string; characterHints: string }) => Promise<void>;
+  onSwitchMode: (mode: "choice" | "smart" | "audiobook") => void;
 }) {
   const [voiceFile, setVoiceFile] = useState<File | null>(null);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState<string | null>(null);
@@ -1030,6 +1258,9 @@ function BoardCreateDialog({
   const [progressText, setProgressText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+  // 有声书表单状态
+  const [novelText, setNovelText] = useState("");
+  const [characterHints, setCharacterHints] = useState("");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingChunksRef = useRef<BlobPart[]>([]);
   const recordingStreamRef = useRef<MediaStream | null>(null);
@@ -1224,8 +1455,8 @@ function BoardCreateDialog({
       <section className="board-modal" onClick={(event) => event.stopPropagation()}>
         <header className="modal-header">
           <div>
-            <strong>{mode === "choice" ? "新建画板" : "智能画板"}</strong>
-            <span>{mode === "choice" ? "选择创建方式" : "根据场景、文稿和可选参考音频生成工作流"}</span>
+            <strong>{mode === "choice" ? "新建画板" : mode === "smart" ? "智能画板" : "智能有声书"}</strong>
+            <span>{mode === "choice" ? "选择创建方式" : mode === "smart" ? "根据场景、文稿和可选参考音频生成工作流" : "输入小说原文和人物信息，AI自动创建角色音色并生成有声书"}</span>
           </div>
           <button className="icon-button" type="button" onClick={onClose} title="关闭">
             ×
@@ -1244,8 +1475,13 @@ function BoardCreateDialog({
               <span>智能画板</span>
               <small>有参考音频则生成克隆链路，无参考音频则生成音色创造链路</small>
             </button>
+            <button type="button" onClick={() => onSwitchMode("audiobook")}>
+              <BookOpen size={18} />
+              <span>智能有声书</span>
+              <small>输入小说原文和人物信息，AI自动创建角色音色并生成有声书</small>
+            </button>
           </div>
-        ) : (
+        ) : mode === "smart" ? (
           <div className="smart-board-form">
             <label className="file-picker nodrag">
               <input accept="audio/*,video/mp4,.mp3,.m4a,.mp4,.wav" type="file" onChange={onFileChange} />
@@ -1296,9 +1532,465 @@ function BoardCreateDialog({
               </button>
             </div>
           </div>
+        ) : (
+          <div className="smart-board-form">
+            <label className="node-field">
+              <span>小说原文</span>
+              <textarea
+                value={novelText}
+                onChange={(event) => setNovelText(event.target.value)}
+                rows={10}
+                placeholder="粘贴小说原文，段落之间用空行分隔"
+              />
+            </label>
+            <label className="node-field">
+              <span>关键人物背景信息</span>
+              <textarea
+                value={characterHints}
+                onChange={(event) => setCharacterHints(event.target.value)}
+                rows={4}
+                placeholder="每行一个角色，格式：角色名，性别，年龄，声音特点&#10;例如：林黛玉，女，16岁，声音清脆柔弱，略带忧伤"
+              />
+            </label>
+            {error ? <p className="node-error">{error}</p> : null}
+            <div className="modal-actions">
+              <button type="button" onClick={() => onSwitchMode("choice")}>
+                返回
+              </button>
+              <button
+                className="run-button"
+                type="button"
+                onClick={() => {
+                  if (!novelText.trim()) {
+                    setError("请输入小说原文。");
+                    return;
+                  }
+                  setError(null);
+                  void onCreateAudiobook({ novelText: novelText.trim(), characterHints: characterHints.trim() });
+                }}
+              >
+                <BookOpen size={16} />
+                创建有声书
+              </button>
+            </div>
+          </div>
         )}
       </section>
     </div>
+  );
+}
+
+// ====== 有声书控制台组件 ======
+
+function AudiobookConsole({
+  workspace,
+  apiKey,
+  apiEndpoint,
+  onPatch,
+  onAnalyze,
+  onGenerateVoice,
+  onDeleteVoice,
+  onAutoAnnotate,
+  onUpdateSegment,
+  onGenerate
+}: {
+  workspace: AudiobookWorkspacePayload;
+  apiKey: string;
+  apiEndpoint: string;
+  onPatch: (patch: Partial<AudiobookWorkspacePayload>) => void;
+  onAnalyze: () => void;
+  onGenerateVoice: (charId: string) => void;
+  onDeleteVoice: (charId: string) => void;
+  onAutoAnnotate: () => void;
+  onUpdateSegment: (segId: string, patch: { characterId: string | null; characterName: string; emotion: string }) => void;
+  onGenerate: () => void;
+}) {
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analyzeProgress, setAnalyzeProgress] = useState(0);
+  const [analyzeText, setAnalyzeText] = useState("");
+  const [annotationMode, setAnnotationMode] = useState<"manual" | "auto">("manual");
+  const [editingSegId, setEditingSegId] = useState<string | null>(null);
+  const [editCharId, setEditCharId] = useState<string>("");
+  const [editEmotion, setEditEmotion] = useState("");
+  const [isAnnotating, setIsAnnotating] = useState(false);
+  const [annotateProgress, setAnnotateProgress] = useState(0);
+  const [annotateText, setAnnotateText] = useState("");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generateProgress, setGenerateProgress] = useState(0);
+  const [generateText, setGenerateText] = useState("");
+  const progressTimerRef = useRef<number | null>(null);
+
+  const allVoicesReady = workspace.characters.length > 0 && workspace.characters.every((c) => c.voiceStatus === "ready");
+  const hasAnnotations = workspace.segments.some((s) => s.characterId || s.characterName);
+
+  function startProgress(
+    setProgress: (v: number) => void,
+    setText: (v: string) => void,
+    stages: { percent: number; text: string }[]
+  ) {
+    let stageIndex = 0;
+    let currentPercent = 5;
+    setProgress(5);
+    setText(stages[0]?.text || "处理中...");
+    function advance() {
+      if (stageIndex < stages.length) {
+        currentPercent = stages[stageIndex].percent;
+        setProgress(currentPercent);
+        setText(stages[stageIndex].text);
+        stageIndex++;
+        progressTimerRef.current = window.setTimeout(advance, 2000 + Math.random() * 2000);
+      } else {
+        // 模拟阶段结束，继续缓慢脉冲动画直到 stopProgress 被调用
+        const base = currentPercent;
+        const pulse = Math.min(base + 2 + Math.random() * 3, 95);
+        setProgress(pulse);
+        progressTimerRef.current = window.setTimeout(() => {
+          setProgress(base);
+          progressTimerRef.current = window.setTimeout(advance, 3000 + Math.random() * 2000);
+        }, 1500);
+      }
+    }
+    progressTimerRef.current = window.setTimeout(advance, 800);
+  }
+
+  function stopProgress(finalProgress: number, setProgress: (v: number) => void) {
+    if (progressTimerRef.current) {
+      window.clearTimeout(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+    setProgress(finalProgress);
+  }
+
+  async function handleAnalyze() {
+    setIsAnalyzing(true);
+    setAnalyzeProgress(0);
+    startProgress(setAnalyzeProgress, setAnalyzeText, [
+      { percent: 15, text: "正在连接 AI 服务..." },
+      { percent: 35, text: "正在阅读小说原文..." },
+      { percent: 55, text: "识别出场人物..." },
+      { percent: 75, text: "生成角色描述..." },
+      { percent: 90, text: "生成音色描述..." },
+      { percent: 95, text: "即将完成..." }
+    ]);
+    try {
+      await onAnalyze();
+      stopProgress(100, setAnalyzeProgress);
+      setAnalyzeText("分析完成！");
+    } catch {
+      stopProgress(0, setAnalyzeProgress);
+      setAnalyzeText("分析失败，请重试");
+    } finally {
+      setTimeout(() => setIsAnalyzing(false), 500);
+    }
+  }
+
+  async function handleAutoAnnotate() {
+    setIsAnnotating(true);
+    setAnnotateProgress(0);
+    startProgress(setAnnotateProgress, setAnnotateText, [
+      { percent: 15, text: "正在连接 AI 服务..." },
+      { percent: 35, text: "分析段落内容..." },
+      { percent: 55, text: "识别对话角色..." },
+      { percent: 75, text: "生成朗读情绪..." },
+      { percent: 90, text: "整理标注结果..." },
+      { percent: 95, text: "即将完成..." }
+    ]);
+    try {
+      await onAutoAnnotate();
+      stopProgress(100, setAnnotateProgress);
+      setAnnotateText("标注完成！");
+    } catch {
+      stopProgress(0, setAnnotateProgress);
+      setAnnotateText("标注失败，请重试");
+    } finally {
+      setTimeout(() => setIsAnnotating(false), 500);
+    }
+  }
+
+  async function handleGenerate() {
+    setIsGenerating(true);
+    setGenerateProgress(0);
+    const totalSegs = workspace.segments.length;
+    startProgress(setGenerateProgress, setGenerateText, [
+      { percent: Math.min(10, 95), text: `准备合成 ${totalSegs} 段音频...` },
+      { percent: Math.min(25, 95), text: "正在合成第 1 段..." },
+      { percent: Math.min(50, 95), text: "合成进行中..." },
+      { percent: Math.min(75, 95), text: "即将完成..." },
+      { percent: 90, text: "收尾处理..." }
+    ]);
+    try {
+      await onGenerate();
+      stopProgress(100, setGenerateProgress);
+      setGenerateText("全部合成完成！");
+    } catch {
+      stopProgress(0, setGenerateProgress);
+      setGenerateText("合成失败，请重试");
+    } finally {
+      setTimeout(() => setIsGenerating(false), 500);
+    }
+  }
+
+  function startEditSegment(segId: string) {
+    const seg = workspace.segments.find((s) => s.id === segId);
+    if (seg) {
+      setEditingSegId(segId);
+      setEditCharId(seg.characterId || "");
+      setEditEmotion(seg.emotion);
+    }
+  }
+
+  function saveEditSegment() {
+    if (!editingSegId) return;
+    const char = workspace.characters.find((c) => c.id === editCharId);
+    onUpdateSegment(editingSegId, {
+      characterId: editCharId || null,
+      characterName: char?.name || "旁白",
+      emotion: editEmotion
+    });
+    setEditingSegId(null);
+  }
+
+  return (
+    <section className="audiobook-panel">
+      <div className="audiobook-titlebar">
+        <BookOpen size={16} />
+        <input
+          value={workspace.name}
+          onChange={(event) => onPatch({ name: event.target.value })}
+          placeholder="未命名有声书"
+        />
+        <span className="audiobook-phase-badge">
+          {workspace.phase === "character-creation" ? "角色创建" : workspace.phase === "annotation" ? "文本标注" : "语音生成"}
+        </span>
+      </div>
+
+      <div className="audiobook-body">
+        {/* 角色创造区域 */}
+        <div className="audiobook-section">
+          <div className="section-header">
+            <h3>角色创造</h3>
+            {workspace.phase === "character-creation" && (
+              <button className="run-button" type="button" onClick={() => void handleAnalyze()} disabled={isAnalyzing}>
+                {isAnalyzing ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />}
+                {isAnalyzing ? "分析中..." : "开始分析"}
+              </button>
+            )}
+          </div>
+
+          {isAnalyzing && (
+            <div className="smart-progress">
+              <div className="smart-progress-bar">
+                <div className="smart-progress-fill" style={{ width: `${analyzeProgress}%` }} />
+              </div>
+              <p className="smart-progress-text">{analyzeText}</p>
+            </div>
+          )}
+
+          {workspace.characters.length === 0 && !isAnalyzing && (
+            <p className="section-hint">点击"开始分析"，AI将从小说原文中识别角色并生成音色描述。</p>
+          )}
+
+          <div className="character-grid">
+            {workspace.characters.map((char) => (
+              <div key={char.id} className="character-card">
+                <div className="character-info">
+                  <strong>{char.name}</strong>
+                  {char.gender && <span className="char-tag">{char.gender}</span>}
+                  {char.age && <span className="char-tag">{char.age}</span>}
+                  <p className="char-personality">{char.personality}</p>
+                  <p className="char-voice-desc">{char.voiceDescription}</p>
+                </div>
+                <div className="character-voice">
+                  {char.voiceStatus === "ready" && char.voiceDataUrl ? (
+                    <>
+                      <StudioAudioPlayer src={char.voiceDataUrl} />
+                      <button className="icon-button" type="button" onClick={() => void onDeleteVoice(char.id)} title="重新生成">
+                        <Trash2 size={14} />
+                      </button>
+                    </>
+                  ) : char.voiceStatus === "generating" ? (
+                    <span className="voice-status generating"><Loader2 className="spin" size={14} /> 生成中...</span>
+                  ) : char.voiceStatus === "error" ? (
+                    <span className="voice-status error">{char.voiceError || "生成失败"}</span>
+                  ) : (
+                    <button className="run-button" type="button" onClick={() => onGenerateVoice(char.id)}>
+                      <AudioLines size={14} />
+                      生成音色
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {workspace.phase === "character-creation" && allVoicesReady && (
+            <button
+              className="run-button phase-advance"
+              type="button"
+              onClick={() => onPatch({ phase: "annotation" })}
+            >
+              确认并进入标注
+            </button>
+          )}
+        </div>
+
+        {/* 标注区域 */}
+        {workspace.phase !== "character-creation" && (
+          <div className="audiobook-section">
+            <div className="section-header">
+              <h3>文本标注</h3>
+              <div className="annotation-controls">
+                <button
+                  className={annotationMode === "manual" ? "mode-btn active" : "mode-btn"}
+                  type="button"
+                  onClick={() => setAnnotationMode("manual")}
+                >
+                  手动标注
+                </button>
+                <button
+                  className={annotationMode === "auto" ? "mode-btn active" : "mode-btn"}
+                  type="button"
+                  onClick={() => setAnnotationMode("auto")}
+                >
+                  自动标注
+                </button>
+                {annotationMode === "auto" && (
+                  <button className="run-button" type="button" onClick={() => void handleAutoAnnotate()} disabled={isAnnotating}>
+                    {isAnnotating ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />}
+                    {isAnnotating ? "标注中..." : "开始自动标注"}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {isAnnotating && (
+              <div className="smart-progress">
+                <div className="smart-progress-bar">
+                  <div className="smart-progress-fill" style={{ width: `${annotateProgress}%` }} />
+                </div>
+                <p className="smart-progress-text">{annotateText}</p>
+              </div>
+            )}
+
+            <div className="segment-list">
+              {workspace.segments.map((seg, index) => (
+                <div key={seg.id} className="segment-block" onDoubleClick={() => startEditSegment(seg.id)}>
+                  <div className="segment-header">
+                    <span className="seg-index">#{index + 1}</span>
+                    {seg.characterName && (
+                      <span className="annotation-badge">
+                        {seg.characterName}
+                        {seg.emotion && ` · ${seg.emotion}`}
+                      </span>
+                    )}
+                  </div>
+                  <p className="segment-text">{seg.text}</p>
+                  {editingSegId === seg.id && (
+                    <div className="segment-editor">
+                      <select value={editCharId} onChange={(e) => setEditCharId(e.target.value)}>
+                        <option value="">旁白</option>
+                        {workspace.characters.map((c) => (
+                          <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                      </select>
+                      <input
+                        type="text"
+                        value={editEmotion}
+                        onChange={(e) => setEditEmotion(e.target.value)}
+                        placeholder="朗读情绪（如：温柔地、焦急地）"
+                      />
+                      <button type="button" onClick={saveEditSegment}>确定</button>
+                      <button type="button" onClick={() => setEditingSegId(null)}>取消</button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {workspace.phase === "annotation" && hasAnnotations && (
+              <>
+                {isGenerating && (
+                  <div className="smart-progress">
+                    <div className="smart-progress-bar">
+                      <div className="smart-progress-fill" style={{ width: `${generateProgress}%` }} />
+                    </div>
+                    <p className="smart-progress-text">{generateText}</p>
+                  </div>
+                )}
+                <button
+                  className="run-button phase-advance"
+                  type="button"
+                  onClick={() => {
+                    onPatch({ phase: "generation" });
+                    void handleGenerate();
+                  }}
+                  disabled={isGenerating}
+                >
+                  {isGenerating ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+                  {isGenerating ? "生成中..." : "一键生成"}
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* 产物列表区域 */}
+        {workspace.products.length > 0 && (
+          <div className="audiobook-section">
+            <div className="section-header">
+              <h3>产物列表</h3>
+              <button
+                className="run-button"
+                type="button"
+                onClick={() => void handleGenerate()}
+                disabled={isGenerating}
+              >
+                {isGenerating ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+                {isGenerating ? "生成中..." : "重新生成"}
+              </button>
+            </div>
+            {isGenerating && (
+              <div className="smart-progress">
+                <div className="smart-progress-bar">
+                  <div className="smart-progress-fill" style={{ width: `${generateProgress}%` }} />
+                </div>
+                <p className="smart-progress-text">{generateText}</p>
+              </div>
+            )}
+            <div className="product-list">
+              {workspace.products.map((prod, index) => (
+                <div key={prod.id} className="product-item">
+                  <div className="product-info">
+                    <span className="product-index">#{index + 1}</span>
+                    <span className="product-char">{prod.characterName}</span>
+                    <span className="product-text">{prod.text.slice(0, 50)}{prod.text.length > 50 ? "..." : ""}</span>
+                  </div>
+                  {prod.status === "ready" && prod.audioDataUrl ? (
+                    <div className="product-actions">
+                      <StudioAudioPlayer src={prod.audioDataUrl} />
+                      <a
+                        className="icon-button"
+                        href={prod.audioDataUrl}
+                        download={`segment-${index + 1}.wav`}
+                        title="下载"
+                      >
+                        <Download size={14} />
+                      </a>
+                    </div>
+                  ) : prod.status === "generating" ? (
+                    <span className="voice-status generating"><Loader2 className="spin" size={14} /> 合成中...</span>
+                  ) : prod.status === "error" ? (
+                    <span className="voice-status error">{prod.error || "失败"}</span>
+                  ) : (
+                    <span className="voice-status">等待中</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 

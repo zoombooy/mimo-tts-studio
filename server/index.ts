@@ -95,8 +95,48 @@ type SmartWorkspaceSegment = {
   directorText: string;
 };
 
-type StoredWorkspace = {
+// ====== 有声书专用类型 ======
+
+type AudiobookCharacter = {
   id: string;
+  name: string;
+  gender: string;
+  age: string;
+  voiceTraits: string;
+  personality: string;
+  voiceDescription: string;
+  voiceDataUrl: string | null;
+  voiceStatus: "pending" | "generating" | "ready" | "error";
+  voiceError?: string;
+};
+
+type AudiobookSegment = {
+  id: string;
+  text: string;
+  characterId: string | null;
+  characterName: string;
+  emotion: string;
+  isAutoAnnotated: boolean;
+};
+
+type AudiobookProduct = {
+  id: string;
+  segmentId: string;
+  characterId: string | null;
+  characterName: string;
+  text: string;
+  instruction: string;
+  audioDataUrl: string | null;
+  status: "pending" | "generating" | "ready" | "error";
+  error?: string;
+  elapsedMs?: number;
+  createdAt: string;
+  synthesisMethod: "voiceClone" | "voiceDesign";
+};
+
+type StoredBoardWorkspace = {
+  id: string;
+  type: "board";
   name: string;
   createdAt: string;
   updatedAt: string;
@@ -105,6 +145,22 @@ type StoredWorkspace = {
   stashItems: unknown[];
   viewport?: unknown;
 };
+
+type StoredAudiobookWorkspace = {
+  id: string;
+  type: "audiobook";
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  novelText: string;
+  characterHints: string;
+  characters: AudiobookCharacter[];
+  segments: AudiobookSegment[];
+  products: AudiobookProduct[];
+  phase: "character-creation" | "annotation" | "generation";
+};
+
+type StoredWorkspace = StoredBoardWorkspace | StoredAudiobookWorkspace;
 
 type WorkspaceStore = {
   activeWorkspaceId: string | null;
@@ -308,15 +364,29 @@ app.get("/api/workspaces", async (_req, res, next) => {
     const store = await readWorkspaceStore();
     res.json({
       activeWorkspaceId: store.activeWorkspaceId,
-      workspaces: store.workspaces.map((workspace) => ({
-        id: workspace.id,
-        name: workspace.name,
-        createdAt: workspace.createdAt,
-        updatedAt: workspace.updatedAt,
-        nodeCount: workspace.nodes.length,
-        edgeCount: workspace.edges.length,
-        stashCount: workspace.stashItems.length
-      }))
+      workspaces: store.workspaces.map((workspace) => {
+        const base = {
+          id: workspace.id,
+          type: workspace.type,
+          name: workspace.name,
+          createdAt: workspace.createdAt,
+          updatedAt: workspace.updatedAt
+        };
+        if (workspace.type === "audiobook") {
+          return {
+            ...base,
+            characterCount: workspace.characters.length,
+            segmentCount: workspace.segments.length,
+            phase: workspace.phase
+          };
+        }
+        return {
+          ...base,
+          nodeCount: workspace.nodes.length,
+          edgeCount: workspace.edges.length,
+          stashCount: workspace.stashItems.length
+        };
+      })
     });
   } catch (error) {
     next(error);
@@ -341,8 +411,9 @@ app.post("/api/workspaces", async (req, res, next) => {
   try {
     const store = await readWorkspaceStore();
     const now = new Date().toISOString();
-    const workspace: StoredWorkspace = {
+    const workspace: StoredBoardWorkspace = {
       id: createId("board"),
+      type: "board",
       name: normalizeWorkspaceName(req.body?.name),
       createdAt: now,
       updatedAt: now,
@@ -491,15 +562,32 @@ app.put("/api/workspaces/:id", async (req, res, next) => {
     }
 
     const current = store.workspaces[index];
-    const updated: StoredWorkspace = {
-      ...current,
-      name: normalizeWorkspaceName(req.body?.name ?? current.name),
-      updatedAt: new Date().toISOString(),
-      nodes: Array.isArray(req.body?.nodes) ? req.body.nodes : current.nodes,
-      edges: Array.isArray(req.body?.edges) ? req.body.edges : current.edges,
-      stashItems: Array.isArray(req.body?.stashItems) ? req.body.stashItems : current.stashItems,
-      viewport: req.body?.viewport ?? current.viewport
-    };
+    const now = new Date().toISOString();
+
+    let updated: StoredWorkspace;
+    if (current.type === "audiobook") {
+      updated = {
+        ...current,
+        name: normalizeWorkspaceName(req.body?.name ?? current.name),
+        updatedAt: now,
+        novelText: req.body?.novelText ?? current.novelText,
+        characterHints: req.body?.characterHints ?? current.characterHints,
+        characters: Array.isArray(req.body?.characters) ? req.body.characters : current.characters,
+        segments: Array.isArray(req.body?.segments) ? req.body.segments : current.segments,
+        products: Array.isArray(req.body?.products) ? req.body.products : current.products,
+        phase: req.body?.phase ?? current.phase
+      };
+    } else {
+      updated = {
+        ...current,
+        name: normalizeWorkspaceName(req.body?.name ?? current.name),
+        updatedAt: now,
+        nodes: Array.isArray(req.body?.nodes) ? req.body.nodes : current.nodes,
+        edges: Array.isArray(req.body?.edges) ? req.body.edges : current.edges,
+        stashItems: Array.isArray(req.body?.stashItems) ? req.body.stashItems : current.stashItems,
+        viewport: req.body?.viewport ?? current.viewport
+      };
+    }
 
     store.workspaces[index] = updated;
     store.activeWorkspaceId = updated.id;
@@ -522,6 +610,505 @@ app.delete("/api/workspaces/:id", async (req, res, next) => {
     store.activeWorkspaceId = store.activeWorkspaceId === req.params.id ? (nextWorkspaces[0]?.id ?? null) : store.activeWorkspaceId;
     await writeWorkspaceStore(store);
     res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ====== 有声书 API ======
+
+app.post("/api/audiobook", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const now = new Date().toISOString();
+    const novelText = String(req.body?.novelText || "").trim();
+    const characterHints = String(req.body?.characterHints || "").trim();
+
+    if (!novelText) {
+      return res.status(400).json({ error: "小说原文不能为空。" });
+    }
+
+    // 按连续空行拆分为段落
+    const paragraphs = novelText.split(/\n\s*\n/).map((p: string) => p.trim()).filter(Boolean);
+    const segments: AudiobookSegment[] = paragraphs.map((text: string, index: number) => ({
+      id: `seg-${Date.now().toString(36)}-${index}`,
+      text,
+      characterId: null,
+      characterName: "",
+      emotion: "",
+      isAutoAnnotated: false
+    }));
+
+    const workspace: StoredAudiobookWorkspace = {
+      id: `book-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      type: "audiobook",
+      name: req.body?.name || `有声书 ${new Date().toLocaleString("zh-CN", { hour12: false })}`,
+      createdAt: now,
+      updatedAt: now,
+      novelText,
+      characterHints,
+      characters: [],
+      segments,
+      products: [],
+      phase: "character-creation"
+    };
+
+    store.workspaces.unshift(workspace);
+    store.activeWorkspaceId = workspace.id;
+    await writeWorkspaceStore(store);
+    res.status(201).json(workspace);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/characters/analyze", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const { apiKey, apiEndpoint } = getApiConfig(req);
+    if (!apiKey) {
+      return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    const systemPrompt = `你是一位专业的有声书制作导演和角色分析师。
+你的任务是从小说原文中识别出所有出场人物，并为每个人物生成音色描述。
+
+要求：
+1. 识别原文中所有有台词或明确出场的人物，忽略仅一笔带过的背景人物。
+2. 对每个人物，综合用户提供的背景信息和原文描写，给出：
+   - name：角色名（使用原文中的名字）
+   - personality：2-3句话的性格/气质描述，用于指导朗读表演
+   - voiceDescription：1-3句话的音色描述，必须适合TTS音色设计模型，包含：性别与年龄段、声音质感（如浑厚/清亮/沙哑/甜美）、情绪基调（如沉稳/活泼/冷峻/温柔）、语速节奏特征。
+3. voiceDescription不要使用混响、回声、EQ等音频工程术语。
+4. 如果用户已提供某角色的背景信息，voiceDescription必须与之一致，不要自行修改性别或年龄。
+5. "旁白/叙述者"不要作为角色列出，旁白将在合成阶段单独处理。
+
+只输出严格JSON，不要Markdown，不要解释。
+JSON结构：{"characters":[{"name":"string","personality":"string","voiceDescription":"string"}]}`;
+
+    const userMessage = `用户提供的关键人物背景信息：
+${workspace.characterHints || "（无）"}
+
+小说原文：
+${workspace.novelText}
+
+请分析出场人物并生成音色描述。`;
+
+    const payload: MimoChatPayload = {
+      model: "mimo-v2.5-pro",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage }
+      ],
+      temperature: 0.35,
+      top_p: 0.9
+    };
+
+    const upstreamResponse = await fetch(apiEndpoint, {
+      method: "POST",
+      headers: { "api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await upstreamResponse.text();
+    if (!upstreamResponse.ok) {
+      return res.status(upstreamResponse.status).json({ error: "LLM调用失败", details: responseText });
+    }
+
+    const parsed = parseJson(responseText) as MimoResponse;
+    const content = parsed?.choices?.[0]?.message?.content;
+    if (!content) {
+      return res.status(502).json({ error: "LLM返回内容为空", raw: responseText });
+    }
+
+    // 解析JSON，兼容markdown代码块
+    let charactersData: { name: string; personality: string; voiceDescription: string }[];
+    try {
+      const cleaned = content.replace(/```json?\s*/g, "").replace(/```\s*/g, "").trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      charactersData = jsonMatch ? JSON.parse(jsonMatch[0]).characters : JSON.parse(cleaned).characters;
+    } catch {
+      return res.status(502).json({ error: "无法解析LLM返回的JSON", raw: content });
+    }
+
+    if (!Array.isArray(charactersData)) {
+      return res.status(502).json({ error: "LLM返回格式错误：缺少characters数组", raw: content });
+    }
+
+    // 匹配用户hints中的角色信息
+    const hintsLines = workspace.characterHints.split("\n").filter(Boolean);
+    const hintMap = new Map<string, { gender: string; age: string; voiceTraits: string }>();
+    for (const line of hintsLines) {
+      const parts = line.split(/[,，、;；]/).map((s: string) => s.trim());
+      if (parts.length >= 1) {
+        const name = parts[0];
+        hintMap.set(name, {
+          gender: parts[1] || "",
+          age: parts[2] || "",
+          voiceTraits: parts.slice(3).join("、")
+        });
+      }
+    }
+
+    const characters: AudiobookCharacter[] = charactersData.map((c, index) => {
+      const hint = hintMap.get(c.name);
+      return {
+        id: `char-${Date.now().toString(36)}-${index}`,
+        name: c.name,
+        gender: hint?.gender || "",
+        age: hint?.age || "",
+        voiceTraits: hint?.voiceTraits || "",
+        personality: c.personality,
+        voiceDescription: c.voiceDescription,
+        voiceDataUrl: null,
+        voiceStatus: "pending" as const
+      };
+    });
+
+    // 更新workspace
+    workspace.characters = characters;
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStore(store);
+
+    res.json({ characters });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/characters/:charId/voice", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const character = workspace.characters.find((c) => c.id === req.params.charId);
+    if (!character) {
+      return res.status(404).json({ error: "角色不存在。" });
+    }
+
+    const { apiKey, apiEndpoint } = getApiConfig(req);
+    if (!apiKey) {
+      return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    character.voiceStatus = "generating";
+    character.voiceError = undefined;
+    await writeWorkspaceStore(store);
+
+    const testText = `大家好，我是${character.name}。很高兴认识你。`;
+    const payload: MimoVoiceDesignPayload = {
+      model: "mimo-v2.5-tts-voicedesign",
+      messages: [
+        { role: "user", content: character.voiceDescription },
+        { role: "assistant", content: testText }
+      ],
+      audio: { format: "wav" }
+    };
+
+    const upstreamResponse = await fetch(apiEndpoint, {
+      method: "POST",
+      headers: { "api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await upstreamResponse.text();
+    if (!upstreamResponse.ok) {
+      character.voiceStatus = "error";
+      character.voiceError = `音色生成失败：HTTP ${upstreamResponse.status}`;
+      await writeWorkspaceStore(store);
+      return res.status(upstreamResponse.status).json({ error: character.voiceError, details: responseText });
+    }
+
+    const audioData = extractAudioData(parseJson(responseText));
+    if (!audioData) {
+      character.voiceStatus = "error";
+      character.voiceError = "音色生成失败：响应中没有音频数据";
+      await writeWorkspaceStore(store);
+      return res.status(502).json({ error: character.voiceError });
+    }
+
+    character.voiceDataUrl = `data:audio/wav;base64,${audioData}`;
+    character.voiceStatus = "ready";
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStore(store);
+
+    res.json({ character });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/audiobook/:id/characters/:charId/voice", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const character = workspace.characters.find((c) => c.id === req.params.charId);
+    if (!character) {
+      return res.status(404).json({ error: "角色不存在。" });
+    }
+
+    character.voiceDataUrl = null;
+    character.voiceStatus = "pending";
+    character.voiceError = undefined;
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStore(store);
+
+    res.json({ character });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/annotate", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const { apiKey, apiEndpoint } = getApiConfig(req);
+    if (!apiKey) {
+      return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    const characterList = workspace.characters.map((c) => `${c.name}：${c.personality}`).join("\n");
+    const segmentList = workspace.segments.map((s, i) => `第${i + 1}段：${s.text}`).join("\n\n");
+
+    const systemPrompt = `你是一位专业的有声书配音导演。
+你的任务是为小说的每个文段标注：说话角色和朗读情绪/语气指导。
+
+规则：
+1. 判断每个文段是对话还是叙述/描写。
+2. 对话：识别说话角色（必须是已注册角色列表中的名字），给出简短的语气描述（如"焦急地""冷淡地""低声说"）。
+3. 叙述/描写：characterName设为"旁白"，emotion描述叙述基调（如"平静地叙述""紧张地描写""略带感伤地回忆"）。
+4. emotion控制在5-15字，描述整体情绪基调即可，不要写逐句朗读指令。
+5. 如果文段中混合了对话和叙述，以主要部分为准。
+
+只输出严格JSON，不要Markdown，不要解释。
+JSON结构：{"annotations":[{"index":1,"characterName":"string","emotion":"string"}]}`;
+
+    const userMessage = `已注册角色列表：
+${characterList || "（无角色）"}
+
+小说文段：
+${segmentList}
+
+请为每段标注角色和朗读情绪。`;
+
+    const payload: MimoChatPayload = {
+      model: "mimo-v2.5-pro",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage }
+      ],
+      temperature: 0.35,
+      top_p: 0.9
+    };
+
+    const upstreamResponse = await fetch(apiEndpoint, {
+      method: "POST",
+      headers: { "api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await upstreamResponse.text();
+    if (!upstreamResponse.ok) {
+      return res.status(upstreamResponse.status).json({ error: "LLM调用失败", details: responseText });
+    }
+
+    const parsed = parseJson(responseText) as MimoResponse;
+    const content = parsed?.choices?.[0]?.message?.content;
+    if (!content) {
+      return res.status(502).json({ error: "LLM返回内容为空" });
+    }
+
+    let annotations: { index: number; characterName: string; emotion: string }[];
+    try {
+      const cleaned = content.replace(/```json?\s*/g, "").replace(/```\s*/g, "").trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      annotations = jsonMatch ? JSON.parse(jsonMatch[0]).annotations : JSON.parse(cleaned).annotations;
+    } catch {
+      return res.status(502).json({ error: "无法解析LLM返回的JSON", raw: content });
+    }
+
+    const charMap = new Map(workspace.characters.map((c) => [c.name, c]));
+
+    for (const ann of annotations) {
+      const segIndex = ann.index - 1;
+      if (segIndex >= 0 && segIndex < workspace.segments.length) {
+        const seg = workspace.segments[segIndex];
+        const matchedChar = charMap.get(ann.characterName);
+        seg.characterId = matchedChar?.id || null;
+        seg.characterName = ann.characterName;
+        seg.emotion = ann.emotion;
+        seg.isAutoAnnotated = true;
+      }
+    }
+
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStore(store);
+
+    res.json({ segments: workspace.segments });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/audiobook/:id/segments/:segId", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const segment = workspace.segments.find((s) => s.id === req.params.segId);
+    if (!segment) {
+      return res.status(404).json({ error: "段落不存在。" });
+    }
+
+    segment.characterId = req.body?.characterId ?? segment.characterId;
+    segment.characterName = req.body?.characterName ?? segment.characterName;
+    segment.emotion = req.body?.emotion ?? segment.emotion;
+    segment.isAutoAnnotated = false;
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStore(store);
+
+    res.json({ segment });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/generate", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const { apiKey, apiEndpoint } = getApiConfig(req);
+    if (!apiKey) {
+      return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    const charMap = new Map(workspace.characters.map((c) => [c.id, c]));
+
+    // 初始化所有 products
+    workspace.products = workspace.segments.map((seg) => ({
+      id: `prod-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      segmentId: seg.id,
+      characterId: seg.characterId,
+      characterName: seg.characterName || "旁白",
+      text: seg.text,
+      instruction: seg.emotion || "自然地朗读",
+      audioDataUrl: null,
+      status: "pending" as const,
+      createdAt: new Date().toISOString(),
+      synthesisMethod: (seg.characterId && charMap.get(seg.characterId)?.voiceDataUrl) ? "voiceClone" as const : "voiceDesign" as const
+    }));
+    await writeWorkspaceStore(store);
+
+    // 顺序生成每段音频
+    for (const product of workspace.products) {
+      product.status = "generating";
+      product.createdAt = new Date().toISOString();
+      await writeWorkspaceStore(store);
+
+      const startMs = Date.now();
+
+      try {
+        if (product.synthesisMethod === "voiceClone") {
+          // 使用 voiceclone
+          const character = charMap.get(product.characterId!);
+          if (!character?.voiceDataUrl) {
+            throw new Error("角色音色数据不存在");
+          }
+
+          // 将 data URL 转为 buffer
+          const base64Data = character.voiceDataUrl.replace(/^data:[^;]+;base64,/, "");
+          const audioBuffer = Buffer.from(base64Data, "base64");
+
+          const form = new FormData();
+          form.append("voice", new Blob([audioBuffer], { type: "audio/wav" }), "voice.wav");
+          form.append("text", product.text);
+          form.append("instruction", product.instruction);
+          form.append("format", "wav");
+
+          const upstreamResponse = await fetch(`${apiEndpoint.replace("/chat/completions", "")}/chat/completions`.replace("//", "/"), {
+            method: "POST",
+            headers: { "api-key": apiKey },
+            body: form
+          });
+
+          const responseText = await upstreamResponse.text();
+          if (!upstreamResponse.ok) {
+            throw new Error(`voiceclone失败：HTTP ${upstreamResponse.status}`);
+          }
+
+          const audioData = extractAudioData(parseJson(responseText));
+          if (!audioData) {
+            throw new Error("voiceclone响应中没有音频数据");
+          }
+
+          product.audioDataUrl = `data:audio/wav;base64,${audioData}`;
+        } else {
+          // 使用 voicedesign（旁白或无音色的角色）
+          const voiceDescription = "自然、清晰的中文叙述音色，语速适中，语气沉稳。";
+          const payload: MimoVoiceDesignPayload = {
+            model: "mimo-v2.5-tts-voicedesign",
+            messages: [
+              { role: "user", content: voiceDescription },
+              { role: "assistant", content: product.text }
+            ],
+            audio: { format: "wav" }
+          };
+
+          const upstreamResponse = await fetch(apiEndpoint, {
+            method: "POST",
+            headers: { "api-key": apiKey, "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+
+          const responseText = await upstreamResponse.text();
+          if (!upstreamResponse.ok) {
+            throw new Error(`voicedesign失败：HTTP ${upstreamResponse.status}`);
+          }
+
+          const audioData = extractAudioData(parseJson(responseText));
+          if (!audioData) {
+            throw new Error("voicedesign响应中没有音频数据");
+          }
+
+          product.audioDataUrl = `data:audio/wav;base64,${audioData}`;
+        }
+
+        product.status = "ready";
+        product.elapsedMs = Date.now() - startMs;
+      } catch (err) {
+        product.status = "error";
+        product.error = err instanceof Error ? err.message : "生成失败";
+        product.elapsedMs = Date.now() - startMs;
+      }
+
+      await writeWorkspaceStore(store);
+    }
+
+    res.json({ products: workspace.products });
   } catch (error) {
     next(error);
   }
@@ -1085,6 +1672,7 @@ function createSmartWorkspace({
 
   return {
     id: workspaceId,
+    type: "board",
     name: workspaceName,
     createdAt: now,
     updatedAt: now,
@@ -1123,6 +1711,7 @@ async function readWorkspaceStore(): Promise<WorkspaceStore> {
       workspaces: [
         {
           id: "board-initial",
+          type: "board",
           name: "默认工作台",
           createdAt: now,
           updatedAt: now,
@@ -1144,13 +1733,13 @@ async function writeWorkspaceStore(store: WorkspaceStore): Promise<void> {
   await rename(tempPath, workspaceFilePath);
 }
 
-function parseWorkspaceStore(raw: string): WorkspaceStore {
+function parseWorkspaceStore(raw: string): { activeWorkspaceId?: string | null; workspaces?: Record<string, unknown>[] } {
   try {
-    return JSON.parse(raw) as WorkspaceStore;
+    return JSON.parse(raw);
   } catch (error) {
     const recovered = parseFirstJsonObject(raw);
     if (recovered) {
-      return recovered as WorkspaceStore;
+      return recovered as { activeWorkspaceId?: string | null; workspaces?: Record<string, unknown>[] };
     }
 
     throw error;
@@ -1198,7 +1787,7 @@ function parseFirstJsonObject(raw: string): unknown | null {
   return null;
 }
 
-function normalizeWorkspaceStore(parsed: WorkspaceStore): WorkspaceStore {
+function normalizeWorkspaceStore(parsed: { activeWorkspaceId?: string | null; workspaces?: Record<string, unknown>[] }): WorkspaceStore {
   const workspaces = Array.isArray(parsed.workspaces) ? parsed.workspaces.map(normalizeStoredWorkspace) : [];
   return {
     activeWorkspaceId: parsed.activeWorkspaceId ?? workspaces[0]?.id ?? null,
@@ -1215,11 +1804,34 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function normalizeStoredWorkspace(workspace: StoredWorkspace): StoredWorkspace {
+function normalizeStoredWorkspace(raw: Record<string, unknown>): StoredWorkspace {
+  // 向后兼容：旧数据没有 type 字段，默认为 board
+  const type = (raw.type as string) || "board";
+
+  if (type === "audiobook") {
+    return {
+      id: String(raw.id || ""),
+      type: "audiobook",
+      name: String(raw.name || ""),
+      createdAt: String(raw.createdAt || ""),
+      updatedAt: String(raw.updatedAt || ""),
+      novelText: String(raw.novelText || ""),
+      characterHints: String(raw.characterHints || ""),
+      characters: Array.isArray(raw.characters) ? raw.characters as AudiobookCharacter[] : [],
+      segments: Array.isArray(raw.segments) ? raw.segments as AudiobookSegment[] : [],
+      products: Array.isArray(raw.products) ? raw.products as AudiobookProduct[] : [],
+      phase: (raw.phase as StoredAudiobookWorkspace["phase"]) || "character-creation"
+    };
+  }
   return {
-    ...workspace,
-    nodes: Array.isArray(workspace.nodes) ? workspace.nodes : [],
-    edges: Array.isArray(workspace.edges) ? workspace.edges : [],
-    stashItems: Array.isArray(workspace.stashItems) ? workspace.stashItems : []
+    id: String(raw.id || ""),
+    type: "board",
+    name: String(raw.name || ""),
+    createdAt: String(raw.createdAt || ""),
+    updatedAt: String(raw.updatedAt || ""),
+    nodes: Array.isArray(raw.nodes) ? raw.nodes : [],
+    edges: Array.isArray(raw.edges) ? raw.edges : [],
+    stashItems: Array.isArray(raw.stashItems) ? raw.stashItems : [],
+    viewport: raw.viewport
   };
 }
