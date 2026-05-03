@@ -24,8 +24,10 @@ const allowedMimeTypes = new Set([
 const mimoEndpoint = "https://api.xiaomimimo.com/v1/chat/completions";
 const dataDir = path.resolve(process.env.MIMO_DATA_DIR || path.join(process.cwd(), "data"));
 const workspaceFilePath = path.join(dataDir, "workspaces.json");
+const audiobookProductTimeoutMs = 60000;
 let workspaceWriteQueue: Promise<void> = Promise.resolve();
 let workspaceWriteSequence = 0;
+const activeAudiobookGenerationJobs = new Set<string>();
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -57,6 +59,14 @@ type MimoChatPayload = {
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
   temperature?: number;
   top_p?: number;
+  thinking?: {
+    type: "enabled" | "disabled";
+  };
+};
+
+type AudiobookSegmentationItem = {
+  speaker?: unknown;
+  text?: unknown;
 };
 
 type MimoResponse = {
@@ -557,30 +567,29 @@ app.post("/api/workspaces/smart", upload.single("voice"), async (req: Request, r
 
 app.put("/api/workspaces/:id", async (req, res, next) => {
   try {
-    const store = await readWorkspaceStore();
-    const index = store.workspaces.findIndex((item) => item.id === req.params.id);
-    if (index === -1) {
-      return res.status(404).json({ error: "Workspace not found." });
-    }
+    const updated = await updateWorkspace(req.params.id, (current) => {
+      const now = new Date().toISOString();
 
-    const current = store.workspaces[index];
-    const now = new Date().toISOString();
+      if (current.type === "audiobook") {
+        const isGenerating = current.products.some((product) => product.status === "pending" || product.status === "generating");
+        return {
+          ...current,
+          name: normalizeWorkspaceName(req.body?.name ?? current.name),
+          updatedAt: now,
+          novelText: req.body?.novelText ?? current.novelText,
+          characterHints: req.body?.characterHints ?? current.characterHints,
+          characters: Array.isArray(req.body?.characters) ? req.body.characters : current.characters,
+          segments: Array.isArray(req.body?.segments) ? req.body.segments : current.segments,
+          products: isGenerating
+            ? current.products
+            : Array.isArray(req.body?.products)
+              ? req.body.products
+              : current.products,
+          phase: isGenerating ? "generation" : req.body?.phase ?? current.phase
+        };
+      }
 
-    let updated: StoredWorkspace;
-    if (current.type === "audiobook") {
-      updated = {
-        ...current,
-        name: normalizeWorkspaceName(req.body?.name ?? current.name),
-        updatedAt: now,
-        novelText: req.body?.novelText ?? current.novelText,
-        characterHints: req.body?.characterHints ?? current.characterHints,
-        characters: Array.isArray(req.body?.characters) ? req.body.characters : current.characters,
-        segments: Array.isArray(req.body?.segments) ? req.body.segments : current.segments,
-        products: Array.isArray(req.body?.products) ? req.body.products : current.products,
-        phase: req.body?.phase ?? current.phase
-      };
-    } else {
-      updated = {
+      return {
         ...current,
         name: normalizeWorkspaceName(req.body?.name ?? current.name),
         updatedAt: now,
@@ -589,11 +598,7 @@ app.put("/api/workspaces/:id", async (req, res, next) => {
         stashItems: Array.isArray(req.body?.stashItems) ? req.body.stashItems : current.stashItems,
         viewport: req.body?.viewport ?? current.viewport
       };
-    }
-
-    store.workspaces[index] = updated;
-    store.activeWorkspaceId = updated.id;
-    await writeWorkspaceStore(store);
+    });
     res.json(updated);
   } catch (error) {
     next(error);
@@ -630,9 +635,13 @@ app.post("/api/audiobook", async (req, res, next) => {
       return res.status(400).json({ error: "小说原文不能为空。" });
     }
 
-    // 按连续空行拆分为段落
-    const paragraphs = novelText.split(/\n\s*\n/).map((p: string) => p.trim()).filter(Boolean);
-    const segments: AudiobookSegment[] = paragraphs.map((text: string, index: number) => ({
+    const { apiKey, apiEndpoint } = getApiConfig(req);
+    if (!apiKey) {
+      return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    const segmentedTexts = await segmentAudiobookText(novelText, apiKey, apiEndpoint);
+    const segments: AudiobookSegment[] = segmentedTexts.map((text: string, index: number) => ({
       id: `seg-${Date.now().toString(36)}-${index}`,
       text,
       characterId: null,
@@ -685,10 +694,11 @@ app.post("/api/audiobook/:id/characters/analyze", async (req, res, next) => {
 2. 对每个人物，综合用户提供的背景信息和原文描写，给出：
    - name：角色名（使用原文中的名字）
    - personality：2-3句话的性格/气质描述，用于指导朗读表演
-   - voiceDescription：1-3句话的音色描述，必须适合TTS音色设计模型，包含：性别与年龄段、声音质感（如浑厚/清亮/沙哑/甜美）、情绪基调（如沉稳/活泼/冷峻/温柔）、语速节奏特征。
+   - voiceDescription：1-3句话的音色描述，必须适合TTS音色设计模型，只描述人物基本信息和稳定声音特征，包含：性别与年龄段、身份/气质、声音质感（如浑厚/清亮/沙哑/甜美）。不要描述语速、节奏、情感、语气或表演状态。
 3. voiceDescription不要使用混响、回声、EQ等音频工程术语。
 4. 如果用户已提供某角色的背景信息，voiceDescription必须与之一致，不要自行修改性别或年龄。
-5. "旁白/叙述者"不要作为角色列出，旁白将在合成阶段单独处理。
+5. voiceDescription必须是静态音色设定，不要写“沉稳地”“焦急地”“缓慢地”“快速地”等朗读指导。
+6. "旁白/叙述者"不要作为角色列出，旁白将在合成阶段单独处理。
 
 只输出严格JSON，不要Markdown，不要解释。
 JSON结构：{"characters":[{"name":"string","personality":"string","voiceDescription":"string"}]}`;
@@ -702,13 +712,14 @@ ${workspace.novelText}
 请分析出场人物并生成音色描述。`;
 
     const payload: MimoChatPayload = {
-      model: "mimo-v2.5-pro",
+      model: "mimo-v2-omni",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage }
       ],
       temperature: 0.35,
-      top_p: 0.9
+      top_p: 0.9,
+      thinking: { type: "disabled" }
     };
 
     const upstreamResponse = await fetch(apiEndpoint, {
@@ -806,11 +817,30 @@ app.post("/api/audiobook/:id/characters/:charId/voice", async (req, res, next) =
       target.voiceError = undefined;
     });
 
+    let optimizedVoiceDescription: string;
+    try {
+      optimizedVoiceDescription = await optimizeAudiobookCharacterVoiceDescription(character, apiKey, apiEndpoint);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "音色描述优化失败";
+      const updatedCharacter = await updateAudiobookCharacter(req.params.id, req.params.charId, (target) => {
+        target.voiceStatus = "error";
+        target.voiceError = errorMessage;
+      });
+      return res.status(502).json({ error: updatedCharacter.voiceError });
+    }
+
+    if (optimizedVoiceDescription && optimizedVoiceDescription !== character.voiceDescription) {
+      character.voiceDescription = optimizedVoiceDescription;
+      await updateAudiobookCharacter(req.params.id, req.params.charId, (target) => {
+        target.voiceDescription = optimizedVoiceDescription;
+      });
+    }
+
     const testText = `大家好，我是${character.name}。很高兴认识你。`;
     const payload: MimoVoiceDesignPayload = {
       model: "mimo-v2.5-tts-voicedesign",
       messages: [
-        { role: "user", content: character.voiceDescription },
+        { role: "user", content: optimizedVoiceDescription || character.voiceDescription },
         { role: "assistant", content: testText }
       ],
       audio: { format: "wav" }
@@ -900,9 +930,9 @@ app.post("/api/audiobook/:id/annotate", async (req, res, next) => {
 
 规则：
 1. 判断每个文段是对话还是叙述/描写。
-2. 对话：识别说话角色（必须是已注册角色列表中的名字），给出简短的语气描述（如"焦急地""冷淡地""低声说"）。
-3. 叙述/描写：characterName设为"旁白"，emotion描述叙述基调（如"平静地叙述""紧张地描写""略带感伤地回忆"）。
-4. emotion控制在5-15字，描述整体情绪基调即可，不要写逐句朗读指令。
+2. 对话：识别说话角色（必须是已注册角色列表中的名字），给出简短的语气描述，并包含情感、语速和场景氛围（如"焦急偏快，压低声""冷淡稍慢，夜色紧绷"）。
+3. 叙述/描写：characterName设为"旁白"，emotion描述叙述基调，并包含情感、语速和场景氛围（如"平静中速，日常叙述""紧张偏快，追逐现场""感伤稍慢，回忆场景"）。
+4. emotion控制在8-24字，保持简洁自然，不要写复杂的逐句朗读指令。
 5. 如果文段中混合了对话和叙述，以主要部分为准。
 
 只输出严格JSON，不要Markdown，不要解释。
@@ -923,7 +953,8 @@ ${segmentList}
         { role: "user", content: userMessage }
       ],
       temperature: 0.35,
-      top_p: 0.9
+      top_p: 0.9,
+      thinking: { type: "disabled" }
     };
 
     const upstreamResponse = await fetch(apiEndpoint, {
@@ -1014,109 +1045,87 @@ app.post("/api/audiobook/:id/generate", async (req, res, next) => {
       return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
     }
 
-    const charMap = new Map(workspace.characters.map((c) => [c.id, c]));
-
-    // 初始化所有 products
-    workspace.products = workspace.segments.map((seg) => ({
-      id: `prod-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-      segmentId: seg.id,
-      characterId: seg.characterId,
-      characterName: seg.characterName || "旁白",
-      text: seg.text,
-      instruction: seg.emotion || "自然地朗读",
-      audioDataUrl: null,
-      status: "pending" as const,
-      createdAt: new Date().toISOString(),
-      synthesisMethod: (seg.characterId && charMap.get(seg.characterId)?.voiceDataUrl) ? "voiceClone" as const : "voiceDesign" as const
-    }));
-    await writeWorkspaceStore(store);
-
-    // 顺序生成每段音频
-    for (const product of workspace.products) {
-      product.status = "generating";
-      product.createdAt = new Date().toISOString();
-      await writeWorkspaceStore(store);
-
-      const startMs = Date.now();
-
-      try {
-        if (product.synthesisMethod === "voiceClone") {
-          // 使用 voiceclone
-          const character = charMap.get(product.characterId!);
-          if (!character?.voiceDataUrl) {
-            throw new Error("角色音色数据不存在");
+    const hasInProgressProducts = workspace.products.some((product) => product.status === "pending" || product.status === "generating");
+    if (hasInProgressProducts) {
+      const products = activeAudiobookGenerationJobs.has(req.params.id)
+        ? workspace.products
+        : await updateAudiobookProducts(req.params.id, (targetWorkspace) => {
+          const now = new Date().toISOString();
+          for (const product of targetWorkspace.products) {
+            if (product.status === "generating") {
+              product.status = "pending";
+              product.error = undefined;
+              product.elapsedMs = undefined;
+              product.createdAt = now;
+            }
           }
+          targetWorkspace.phase = "generation";
+          return targetWorkspace.products.map((product) => ({ ...product }));
+        });
 
-          // 将 data URL 转为 buffer
-          const base64Data = character.voiceDataUrl.replace(/^data:[^;]+;base64,/, "");
-          const audioBuffer = Buffer.from(base64Data, "base64");
-
-          const form = new FormData();
-          form.append("voice", new Blob([audioBuffer], { type: "audio/wav" }), "voice.wav");
-          form.append("text", product.text);
-          form.append("instruction", product.instruction);
-          form.append("format", "wav");
-
-          const upstreamResponse = await fetch(`${apiEndpoint.replace("/chat/completions", "")}/chat/completions`.replace("//", "/"), {
-            method: "POST",
-            headers: { "api-key": apiKey },
-            body: form
-          });
-
-          const responseText = await upstreamResponse.text();
-          if (!upstreamResponse.ok) {
-            throw new Error(`voiceclone失败：HTTP ${upstreamResponse.status}`);
-          }
-
-          const audioData = extractAudioData(parseJson(responseText));
-          if (!audioData) {
-            throw new Error("voiceclone响应中没有音频数据");
-          }
-
-          product.audioDataUrl = `data:audio/wav;base64,${audioData}`;
-        } else {
-          // 使用 voicedesign（旁白或无音色的角色）
-          const voiceDescription = "自然、清晰的中文叙述音色，语速适中，语气沉稳。";
-          const payload: MimoVoiceDesignPayload = {
-            model: "mimo-v2.5-tts-voicedesign",
-            messages: [
-              { role: "user", content: voiceDescription },
-              { role: "assistant", content: product.text }
-            ],
-            audio: { format: "wav" }
-          };
-
-          const upstreamResponse = await fetch(apiEndpoint, {
-            method: "POST",
-            headers: { "api-key": apiKey, "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-
-          const responseText = await upstreamResponse.text();
-          if (!upstreamResponse.ok) {
-            throw new Error(`voicedesign失败：HTTP ${upstreamResponse.status}`);
-          }
-
-          const audioData = extractAudioData(parseJson(responseText));
-          if (!audioData) {
-            throw new Error("voicedesign响应中没有音频数据");
-          }
-
-          product.audioDataUrl = `data:audio/wav;base64,${audioData}`;
-        }
-
-        product.status = "ready";
-        product.elapsedMs = Date.now() - startMs;
-      } catch (err) {
-        product.status = "error";
-        product.error = err instanceof Error ? err.message : "生成失败";
-        product.elapsedMs = Date.now() - startMs;
-      }
-
-      await writeWorkspaceStore(store);
+      startAudiobookGenerationJob(req.params.id, apiKey, apiEndpoint);
+      return res.status(202).json({ products, running: true });
     }
 
-    res.json({ products: workspace.products });
+    const products = await updateAudiobookProducts(req.params.id, (targetWorkspace) => {
+      const charMap = new Map(targetWorkspace.characters.map((c) => [c.id, c]));
+      const now = new Date().toISOString();
+      targetWorkspace.products = targetWorkspace.segments.map((seg) => ({
+        id: `prod-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+        segmentId: seg.id,
+        characterId: seg.characterId,
+        characterName: seg.characterName || "旁白",
+        text: seg.text,
+        instruction: seg.emotion || "自然地朗读",
+        audioDataUrl: null,
+        status: "pending" as const,
+        createdAt: now,
+        synthesisMethod: (seg.characterId && charMap.get(seg.characterId)?.voiceDataUrl) ? "voiceClone" as const : "voiceDesign" as const
+      }));
+      targetWorkspace.phase = "generation";
+      return targetWorkspace.products.map((product) => ({ ...product }));
+    });
+
+    startAudiobookGenerationJob(req.params.id, apiKey, apiEndpoint);
+    res.status(202).json({ products, running: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/products/:productId/retry", async (req, res, next) => {
+  try {
+    const { apiKey, apiEndpoint } = getApiConfig(req);
+    if (!apiKey) {
+      return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    const product = await updateAudiobookProduct(req.params.id, req.params.productId, (target) => {
+      target.status = "generating";
+      target.audioDataUrl = null;
+      target.error = undefined;
+      target.elapsedMs = undefined;
+      target.createdAt = new Date().toISOString();
+    });
+
+    const startMs = Date.now();
+    try {
+      const audioDataUrl = await synthesizeAudiobookProduct(req.params.id, product, apiKey, apiEndpoint);
+      const updatedProduct = await updateAudiobookProduct(req.params.id, product.id, (target) => {
+        target.audioDataUrl = audioDataUrl;
+        target.status = "ready";
+        target.error = undefined;
+        target.elapsedMs = Date.now() - startMs;
+      });
+      res.json({ product: updatedProduct });
+    } catch (error) {
+      const updatedProduct = await updateAudiobookProduct(req.params.id, product.id, (target) => {
+        target.status = "error";
+        target.error = error instanceof Error ? error.message : "生成失败";
+        target.elapsedMs = Date.now() - startMs;
+      });
+      res.status(500).json({ product: updatedProduct, error: updatedProduct.error });
+    }
   } catch (error) {
     next(error);
   }
@@ -1442,6 +1451,66 @@ function extractMessageContent(value: unknown): string | null {
   return typeof content === "string" && content.length > 0 ? content : null;
 }
 
+async function optimizeAudiobookCharacterVoiceDescription(
+  character: AudiobookCharacter,
+  apiKey: string,
+  apiEndpoint: string
+): Promise<string> {
+  const payload: MimoChatPayload = {
+    model: "mimo-v2.5-pro",
+    messages: [
+      {
+        role: "system",
+        content: [
+          "你是专业的有声书角色音色提示词编辑。",
+          "你的任务是把角色信息整理成适合 mimo-v2.5-tts-voicedesign 的音色描述。",
+          "",
+          "要求：",
+          "1. 只描述人物基本信息和稳定声音特征：性别、年龄段、身份/气质、声音质感。",
+          "2. 不要描述语速、节奏、情感、语气、场景、动作或表演状态。",
+          "3. 不要使用混响、回声、EQ、压缩等音频工程术语。",
+          "4. 输出1到3句中文，不要Markdown，不要解释。"
+        ].join("\n")
+      },
+      {
+        role: "user",
+        content: [
+          `角色名：${character.name}`,
+          `性别：${character.gender || "未知"}`,
+          `年龄：${character.age || "未知"}`,
+          `人物气质：${character.personality || "未提供"}`,
+          `用户音色备注：${character.voiceTraits || "未提供"}`,
+          `当前音色描述：${character.voiceDescription || "未提供"}`
+        ].join("\n")
+      }
+    ],
+    temperature: 0.2,
+    top_p: 0.8,
+    thinking: { type: "disabled" }
+  };
+
+  const upstreamResponse = await fetch(apiEndpoint, {
+    method: "POST",
+    headers: { "api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  const responseText = await upstreamResponse.text();
+  if (!upstreamResponse.ok) {
+    throw Object.assign(new Error(`音色描述优化失败：HTTP ${upstreamResponse.status}`), {
+      status: upstreamResponse.status,
+      details: responseText
+    });
+  }
+
+  const content = extractMessageContent(parseJson(responseText));
+  if (!content) {
+    throw new Error("音色描述优化失败：模型返回内容为空");
+  }
+
+  return content.replace(/```(?:text|markdown)?\s*/gi, "").replace(/```\s*/g, "").trim();
+}
+
 function getChoiceCount(value: unknown): number {
   if (!value || typeof value !== "object" || !("choices" in value)) {
     return 0;
@@ -1449,6 +1518,84 @@ function getChoiceCount(value: unknown): number {
 
   const choices = (value as { choices?: unknown }).choices;
   return Array.isArray(choices) ? choices.length : 0;
+}
+
+async function segmentAudiobookText(novelText: string, apiKey: string, apiEndpoint: string): Promise<string[]> {
+  const payload: MimoChatPayload = {
+    model: "mimo-v2.5-pro",
+    messages: [
+      {
+        role: "system",
+        content: [
+          "你是专业的有声书文稿切分助手。",
+          "你的任务是把小说原文切分为适合后续配音生成的片段。",
+          "",
+          "严格规则：",
+          "1. 必须遵循原文出现顺序，不能重排、改写、总结或补写。",
+          "2. 每个片段只能有一个说话人。",
+          "3. 不要将旁白和角色对话混为一段；旁白、每个角色的对话都要拆开。",
+          "4. 如果一段文字里同时包含旁白和对话，必须拆成多个片段。",
+          "5. 引号内的内容通常是角色台词；引号外的动作、神态、语气、心理、叙述说明通常是旁白，必须单独成段。",
+          "6. 如果一句话中出现：台词 + 她/他/某人说道/喃喃道/问道/笑道 + 台词，必须拆成：台词、旁白、台词 三段。",
+          "7. 同一角色连续说话可以合并为一段；不同角色连续对话必须拆开。",
+          "8. 片段 text 必须尽量保留原文字符，只允许去掉片段首尾多余空白。",
+          "9. 输出必须覆盖全部原文内容，不要遗漏。",
+          "",
+          "切分示例：",
+          "原文：“你的内力……”她喃喃道，声音里第一次带上了难以置信的意味，“你练的是什么功法？”",
+          "应输出三个连续片段：",
+          "1) speaker=角色, text=“你的内力……”",
+          "2) speaker=旁白, text=她喃喃道，声音里第一次带上了难以置信的意味，",
+          "3) speaker=角色, text=“你练的是什么功法？”",
+          "",
+          "只输出严格 JSON，不要 Markdown，不要解释。",
+          "JSON 结构：{\"segments\":[{\"speaker\":\"旁白或角色名\",\"text\":\"原文片段\"}]}"        ].join("\n")
+      },
+      {
+        role: "user",
+        content: `请切分下面的小说原文：\n\n${novelText}`
+      }
+    ],
+    temperature: 0.1,
+    top_p: 0.8,
+    thinking: { type: "disabled" }
+  };
+
+  const upstreamResponse = await fetch(apiEndpoint, {
+    method: "POST",
+    headers: { "api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  const responseText = await upstreamResponse.text();
+  if (!upstreamResponse.ok) {
+    throw Object.assign(new Error(`文段切分失败：HTTP ${upstreamResponse.status}`), { status: upstreamResponse.status, details: responseText });
+  }
+
+  const content = extractMessageContent(parseJson(responseText));
+  if (!content) {
+    throw new Error("文段切分失败：模型返回内容为空");
+  }
+
+  const segments = parseAudiobookSegmentation(content);
+  if (segments.length === 0) {
+    throw new Error("文段切分失败：模型没有返回有效片段");
+  }
+
+  return segments;
+}
+
+function parseAudiobookSegmentation(content: string): string[] {
+  const cleaned = content.replace(/```json?\s*/g, "").replace(/```\s*/g, "").trim();
+  const parsed = parseJson(cleaned) ?? parseJson(cleaned.match(/\{[\s\S]*\}/)?.[0] || "");
+  const rawSegments = (parsed as { segments?: AudiobookSegmentationItem[] } | null)?.segments;
+  if (!Array.isArray(rawSegments)) {
+    return [];
+  }
+
+  return rawSegments
+    .map((item) => (typeof item?.text === "string" ? item.text.trim() : ""))
+    .filter(Boolean);
 }
 
 function redactPayload(payload: MimoPayload, file: Express.Multer.File) {
@@ -1757,6 +1904,25 @@ async function writeWorkspaceStoreNow(store: WorkspaceStore): Promise<void> {
   }
 }
 
+async function updateWorkspace(workspaceId: string, update: (workspace: StoredWorkspace) => StoredWorkspace): Promise<StoredWorkspace> {
+  const operation = workspaceWriteQueue.then(async () => {
+    const store = await readWorkspaceStoreNow();
+    const index = store.workspaces.findIndex((item) => item.id === workspaceId);
+    if (index === -1) {
+      throw Object.assign(new Error("Workspace not found."), { status: 404 });
+    }
+
+    const updated = update(store.workspaces[index]);
+    store.workspaces[index] = updated;
+    store.activeWorkspaceId = updated.id;
+    await writeWorkspaceStoreNow(store);
+    return updated;
+  });
+
+  workspaceWriteQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
 async function renameWithRetry(from: string, to: string): Promise<void> {
   const retryableCodes = new Set(["EPERM", "EACCES", "EBUSY"]);
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -1802,6 +1968,202 @@ async function updateAudiobookCharacter(
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function startAudiobookGenerationJob(workspaceId: string, apiKey: string, apiEndpoint: string): void {
+  if (activeAudiobookGenerationJobs.has(workspaceId)) {
+    return;
+  }
+
+  activeAudiobookGenerationJobs.add(workspaceId);
+  void generateAudiobookProductsInBatches(workspaceId, apiKey, apiEndpoint)
+    .catch((error) => {
+      console.error("[audiobook:generate] background generation failed", error);
+    })
+    .finally(() => {
+      activeAudiobookGenerationJobs.delete(workspaceId);
+    });
+}
+
+async function fetchTextWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<{ response: globalThis.Response; text: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const text = await response.text();
+    return { response, text };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`生成超时（${Math.round(timeoutMs / 1000)}秒），已跳过`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function generateAudiobookProductsInBatches(workspaceId: string, apiKey: string, apiEndpoint: string): Promise<void> {
+  const batchSize = 20;
+
+  while (true) {
+    const batch = await updateAudiobookProducts(workspaceId, (workspace) => {
+      const pending = workspace.products.filter((product) => product.status === "pending").slice(0, batchSize);
+      const startedAt = new Date().toISOString();
+      for (const product of pending) {
+        product.status = "generating";
+        product.error = undefined;
+        product.createdAt = startedAt;
+      }
+      return pending.map((product) => ({ ...product }));
+    });
+
+    if (batch.length === 0) {
+      return;
+    }
+
+    await Promise.all(
+      batch.map(async (product) => {
+        const startMs = Date.now();
+        try {
+          const audioDataUrl = await synthesizeAudiobookProduct(workspaceId, product, apiKey, apiEndpoint);
+          await updateAudiobookProduct(workspaceId, product.id, (target) => {
+            target.audioDataUrl = audioDataUrl;
+            target.status = "ready";
+            target.error = undefined;
+            target.elapsedMs = Date.now() - startMs;
+          });
+        } catch (error) {
+          await updateAudiobookProduct(workspaceId, product.id, (target) => {
+            target.status = "error";
+            target.error = error instanceof Error ? error.message : "生成失败";
+            target.elapsedMs = Date.now() - startMs;
+          });
+        }
+      })
+    );
+  }
+}
+
+async function synthesizeAudiobookProduct(
+  workspaceId: string,
+  product: AudiobookProduct,
+  apiKey: string,
+  apiEndpoint: string
+): Promise<string> {
+  if (product.synthesisMethod === "voiceClone") {
+    const character = await getAudiobookCharacterSnapshot(workspaceId, product.characterId);
+    if (!character?.voiceDataUrl) {
+      throw new Error("角色音色数据不存在");
+    }
+
+    const payload: MimoPayload = {
+      model: "mimo-v2.5-tts-voiceclone",
+      messages: [
+        { role: "user", content: product.instruction },
+        { role: "assistant", content: product.text }
+      ],
+      audio: {
+        format: "wav",
+        voice: character.voiceDataUrl
+      }
+    };
+
+    const { response: upstreamResponse, text: responseText } = await fetchTextWithTimeout(apiEndpoint, {
+      method: "POST",
+      headers: { "api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }, audiobookProductTimeoutMs);
+    if (!upstreamResponse.ok) {
+      throw new Error(`voiceclone失败：HTTP ${upstreamResponse.status}`);
+    }
+
+    const audioData = extractAudioData(parseJson(responseText));
+    if (!audioData) {
+      throw new Error("voiceclone响应中没有音频数据");
+    }
+
+    return `data:audio/wav;base64,${audioData}`;
+  }
+
+  const voiceDescription = "自然、清晰的中文旁白音色，语速适中，语气沉稳。";
+  const payload: MimoVoiceDesignPayload = {
+    model: "mimo-v2.5-tts-voicedesign",
+    messages: [
+      { role: "user", content: voiceDescription },
+      { role: "assistant", content: product.text }
+    ],
+    audio: { format: "wav" }
+  };
+
+  const { response: upstreamResponse, text: responseText } = await fetchTextWithTimeout(apiEndpoint, {
+    method: "POST",
+    headers: { "api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }, audiobookProductTimeoutMs);
+  if (!upstreamResponse.ok) {
+    throw new Error(`voicedesign失败：HTTP ${upstreamResponse.status}`);
+  }
+
+  const audioData = extractAudioData(parseJson(responseText));
+  if (!audioData) {
+    throw new Error("voicedesign响应中没有音频数据");
+  }
+
+  return `data:audio/wav;base64,${audioData}`;
+}
+
+async function getAudiobookCharacterSnapshot(workspaceId: string, characterId: string | null): Promise<AudiobookCharacter | null> {
+  if (!characterId) {
+    return null;
+  }
+
+  const store = await readWorkspaceStore();
+  const workspace = store.workspaces.find((w) => w.id === workspaceId);
+  if (!workspace || workspace.type !== "audiobook") {
+    return null;
+  }
+
+  const character = workspace.characters.find((item) => item.id === characterId);
+  return character ? { ...character } : null;
+}
+
+async function updateAudiobookProduct(
+  workspaceId: string,
+  productId: string,
+  update: (product: AudiobookProduct, workspace: StoredAudiobookWorkspace) => void
+): Promise<AudiobookProduct> {
+  const product = await updateAudiobookProducts(workspaceId, (workspace) => {
+    const target = workspace.products.find((item) => item.id === productId);
+    if (!target) {
+      throw Object.assign(new Error("Audiobook product not found."), { status: 404 });
+    }
+    update(target, workspace);
+    return { ...target };
+  });
+  return product;
+}
+
+async function updateAudiobookProducts<T>(workspaceId: string, update: (workspace: StoredAudiobookWorkspace) => T): Promise<T> {
+  const operation = workspaceWriteQueue.then(async () => {
+    const store = await readWorkspaceStoreNow();
+    const workspace = store.workspaces.find((w) => w.id === workspaceId);
+    if (!workspace || workspace.type !== "audiobook") {
+      throw Object.assign(new Error("Audiobook workspace not found."), { status: 404 });
+    }
+
+    const result = update(workspace);
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStoreNow(store);
+    return result;
+  });
+
+  workspaceWriteQueue = operation.then(() => undefined, () => undefined);
+  return operation;
 }
 
 function parseWorkspaceStore(raw: string): { activeWorkspaceId?: string | null; workspaces?: Record<string, unknown>[] } {

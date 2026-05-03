@@ -38,6 +38,7 @@ import {
   PanelTop,
   Play,
   Plus,
+  RefreshCw,
   Save,
   Sparkles,
   Square,
@@ -504,14 +505,11 @@ function StudioApp() {
   }
 
   async function analyzeAudiobookCharacters() {
-    console.log("[analyzeCharacters] called, activeWorkspace:", activeWorkspace?.id, activeWorkspace?.type);
     if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
-    console.log("[analyzeCharacters] sending request to:", `/api/audiobook/${activeWorkspace.id}/characters/analyze`);
     const response = await fetch(`/api/audiobook/${activeWorkspace.id}/characters/analyze`, {
       method: "POST",
       headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
     });
-    console.log("[analyzeCharacters] response status:", response.status);
     const result = (await response.json()) as { characters?: AudiobookCharacter[]; error?: string };
     if (!response.ok) {
       throw new Error(result.error || "角色分析失败");
@@ -607,8 +605,9 @@ function StudioApp() {
 
   async function generateAudiobookAudio() {
     if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
+    const workspaceId = activeWorkspace.id;
     patchAudiobook({ phase: "generation" });
-    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/generate`, {
+    const response = await fetch(`/api/audiobook/${workspaceId}/generate`, {
       method: "POST",
       headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
     });
@@ -617,6 +616,71 @@ function StudioApp() {
       throw new Error(result.error || "生成失败");
     }
     patchAudiobook({ products: result.products ?? [] });
+    await pollAudiobookGeneration(workspaceId);
+  }
+
+  async function retryAudiobookProduct(productId: string) {
+    if (!activeWorkspace || activeWorkspace.type !== "audiobook") return;
+    const workspaceId = activeWorkspace.id;
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "audiobook" || workspace.id !== workspaceId) return workspace;
+      return {
+        ...workspace,
+        products: workspace.products.map((product) =>
+          product.id === productId
+            ? { ...product, status: "generating" as AudiobookProduct["status"], audioDataUrl: null, error: undefined, elapsedMs: undefined }
+            : product
+        )
+      };
+    });
+
+    const response = await fetch(`/api/audiobook/${workspaceId}/products/${productId}/retry`, {
+      method: "POST",
+      headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
+    });
+    const result = (await response.json()) as { product?: AudiobookProduct; error?: string };
+    if (result.product) {
+      setActiveWorkspace((workspace) => {
+        if (!workspace || workspace.type !== "audiobook" || workspace.id !== workspaceId) return workspace;
+        return {
+          ...workspace,
+          products: workspace.products.map((product) => (product.id === productId ? result.product! : product))
+        };
+      });
+    }
+    if (!response.ok && !result.product) {
+      throw new Error(result.error || "重试生成失败");
+    }
+  }
+
+  async function pollAudiobookGeneration(workspaceId: string) {
+    for (let attempt = 0; attempt < 240; attempt++) {
+      await wait(1500);
+      const response = await fetch(`/api/workspaces/${workspaceId}`);
+      if (!response.ok) {
+        throw new Error(`刷新有声书生成进度失败：HTTP ${response.status}`);
+      }
+
+      const workspace = (await response.json()) as WorkspacePayload;
+      if (workspace.type !== "audiobook") {
+        throw new Error("工作区类型异常");
+      }
+
+      setActiveWorkspace((current) => {
+        if (!current || current.type !== "audiobook" || current.id !== workspaceId) return current;
+        return workspace;
+      });
+
+      if (!workspace.products.some((product) => product.status === "pending" || product.status === "generating")) {
+        return;
+      }
+    }
+
+    throw new Error("有声书生成仍在进行中，请稍后刷新查看结果。");
+  }
+
+  function wait(ms: number) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   async function deleteWorkspace() {
@@ -637,47 +701,52 @@ function StudioApp() {
     }
 
     setIsSaving(true);
+    try {
+      let body: Record<string, unknown>;
+      if (activeWorkspace.type === "audiobook") {
+        body = {
+          name: activeWorkspace.name,
+          novelText: activeWorkspace.novelText,
+          characterHints: activeWorkspace.characterHints,
+          characters: activeWorkspace.characters,
+          segments: activeWorkspace.segments,
+          products: activeWorkspace.products,
+          phase: activeWorkspace.phase
+        };
+      } else {
+        const cleanNodes = nodes.map(stripNodeCallbacks);
+        body = {
+          name: activeWorkspace.name,
+          nodes: cleanNodes,
+          edges,
+          stashItems: activeWorkspace.stashItems ?? []
+        };
+      }
 
-    let body: Record<string, unknown>;
-    if (activeWorkspace.type === "audiobook") {
-      body = {
-        name: activeWorkspace.name,
-        novelText: activeWorkspace.novelText,
-        characterHints: activeWorkspace.characterHints,
-        characters: activeWorkspace.characters,
-        segments: activeWorkspace.segments,
-        products: activeWorkspace.products,
-        phase: activeWorkspace.phase
-      };
-    } else {
-      const cleanNodes = nodes.map(stripNodeCallbacks);
-      body = {
-        name: activeWorkspace.name,
-        nodes: cleanNodes,
-        edges,
-        stashItems: activeWorkspace.stashItems ?? []
-      };
+      const response = await fetch(`/api/workspaces/${activeWorkspace.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const saved = (await response.json()) as WorkspacePayload & { error?: string };
+      if (!response.ok) {
+        throw new Error(saved.error || `保存失败：HTTP ${response.status}`);
+      }
+      setActiveWorkspace(saved);
+      setWorkspaces((items) =>
+        items.map((item) =>
+          item.id === saved.id
+            ? {
+                ...item,
+                name: saved.name,
+                updatedAt: saved.updatedAt
+              }
+            : item
+        )
+      );
+    } finally {
+      setIsSaving(false);
     }
-
-    const response = await fetch(`/api/workspaces/${activeWorkspace.id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    const saved = (await response.json()) as WorkspacePayload;
-    setActiveWorkspace(saved);
-    setWorkspaces((items) =>
-      items.map((item) =>
-        item.id === saved.id
-          ? {
-              ...item,
-              name: saved.name,
-              updatedAt: saved.updatedAt
-            }
-          : item
-      )
-    );
-    setIsSaving(false);
   }
 
   function patchWorkspaceName(name: string) {
@@ -1193,7 +1262,9 @@ function StudioApp() {
             onDeleteVoice={(charId) => void deleteCharacterVoice(charId)}
             onAutoAnnotate={autoAnnotateAudiobook}
             onUpdateSegment={(segId, patch) => void updateAudiobookSegment(segId, patch)}
+            onSaveWorkspace={saveWorkspace}
             onGenerate={generateAudiobookAudio}
+            onRetryProduct={retryAudiobookProduct}
           />
         ) : (
           <section className="canvas-panel">
@@ -1240,7 +1311,6 @@ function StudioApp() {
           }}
           onCreateSmart={createSmartWorkspace}
           onCreateAudiobook={async (data) => {
-            setBoardDialog(null);
             await createAudiobookWorkspace(data);
           }}
           onSwitchMode={setBoardDialog}
@@ -1273,6 +1343,7 @@ function BoardCreateDialog({
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState("");
+  const [isCreatingAudiobook, setIsCreatingAudiobook] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   // 有声书表单状态
@@ -1297,20 +1368,29 @@ function BoardCreateDialog({
   const progressStages = [
     { percent: 15, text: "正在读取..." },
     { percent: 35, text: "正在分析情感..." },
-    { percent: 55, text: "打个草稿..." },
-    { percent: 75, text: "画布创建中..." },
-    { percent: 90, text: "收个尾..." },
+    { percent: 55, text: "正在规划画板..." },
+    { percent: 75, text: "画板创建中..." },
+    { percent: 90, text: "正在收尾..." },
     { percent: 95, text: "马上就好了..." }
   ];
 
-  function startProgressSimulation() {
+  const audiobookProgressStages = [
+    { percent: 12, text: "正在连接文段切分模型..." },
+    { percent: 28, text: "正在阅读小说原文..." },
+    { percent: 45, text: "正在识别旁白和角色对话..." },
+    { percent: 62, text: "正在拆分单一说话人片段..." },
+    { percent: 82, text: "正在整理有声书结构..." },
+    { percent: 95, text: "即将创建画板..." }
+  ];
+
+  function startProgressSimulation(stages = progressStages, initialText = "正在连接 AI 服务...") {
     setProgress(0);
-    setProgressText("正在连接 AI 服务...");
+    setProgressText(initialText);
     let stageIndex = 0;
 
     function advance() {
-      if (stageIndex < progressStages.length) {
-        const stage = progressStages[stageIndex];
+      if (stageIndex < stages.length) {
+        const stage = stages[stageIndex];
         setProgress(stage.percent);
         setProgressText(stage.text);
         stageIndex++;
@@ -1467,15 +1547,40 @@ function BoardCreateDialog({
     }
   }
 
+  async function submitAudiobookWorkspace() {
+    if (!novelText.trim()) {
+      setError("请输入小说原文。");
+      return;
+    }
+
+    setIsCreatingAudiobook(true);
+    setError(null);
+    startProgressSimulation(audiobookProgressStages, "正在连接文段切分模型...");
+    try {
+      await onCreateAudiobook({ novelText: novelText.trim(), characterHints: characterHints.trim() });
+      stopProgressSimulation(100);
+      setProgressText("有声书创建完成");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      onClose();
+    } catch (submitError) {
+      stopProgressSimulation(0);
+      setError(submitError instanceof Error ? submitError.message : "创建有声书失败。");
+    } finally {
+      setIsCreatingAudiobook(false);
+    }
+  }
+
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" onClick={() => {
+      if (!isGenerating && !isCreatingAudiobook) onClose();
+    }}>
       <section className="board-modal" onClick={(event) => event.stopPropagation()}>
         <header className="modal-header">
           <div>
             <strong>{mode === "choice" ? "新建画板" : mode === "smart" ? "智能画板" : "智能有声书"}</strong>
             <span>{mode === "choice" ? "选择创建方式" : mode === "smart" ? "根据场景、文稿和可选参考音频生成工作流" : "输入小说原文和人物信息，AI自动创建角色音色并生成有声书"}</span>
           </div>
-          <button className="icon-button" type="button" onClick={onClose} title="关闭">
+          <button className="icon-button" type="button" onClick={onClose} title="关闭" disabled={isGenerating || isCreatingAudiobook}>
             ×
           </button>
         </header>
@@ -1557,7 +1662,8 @@ function BoardCreateDialog({
                 value={novelText}
                 onChange={(event) => setNovelText(event.target.value)}
                 rows={10}
-                placeholder="粘贴小说原文，段落之间用空行分隔"
+                placeholder="粘贴小说原文，AI 会按旁白和角色对话切分片段"
+                disabled={isCreatingAudiobook}
               />
             </label>
             <label className="node-field">
@@ -1566,28 +1672,31 @@ function BoardCreateDialog({
                 value={characterHints}
                 onChange={(event) => setCharacterHints(event.target.value)}
                 rows={4}
-                placeholder="每行一个角色，格式：角色名，性别，年龄，声音特点&#10;例如：林黛玉，女，16岁，声音清脆柔弱，略带忧伤"
+                placeholder={"每行一个角色，格式：角色名，性别，年龄，声音特点\n例如：林黛玉，女，16岁，声音清脆柔弱，略带哀愁"}
+                disabled={isCreatingAudiobook}
               />
             </label>
             {error ? <p className="node-error">{error}</p> : null}
+            {isCreatingAudiobook && (
+              <div className="smart-progress">
+                <div className="smart-progress-bar">
+                  <div className="smart-progress-fill" style={{ width: `${progress}%` }} />
+                </div>
+                <p className="smart-progress-text">{progressText}</p>
+              </div>
+            )}
             <div className="modal-actions">
-              <button type="button" onClick={() => onSwitchMode("choice")}>
+              <button type="button" onClick={() => onSwitchMode("choice")} disabled={isCreatingAudiobook}>
                 返回
               </button>
               <button
                 className="run-button"
                 type="button"
-                onClick={() => {
-                  if (!novelText.trim()) {
-                    setError("请输入小说原文。");
-                    return;
-                  }
-                  setError(null);
-                  void onCreateAudiobook({ novelText: novelText.trim(), characterHints: characterHints.trim() });
-                }}
+                onClick={() => void submitAudiobookWorkspace()}
+                disabled={isCreatingAudiobook}
               >
-                <BookOpen size={16} />
-                创建有声书
+                {isCreatingAudiobook ? <Loader2 className="spin" size={16} /> : <BookOpen size={16} />}
+                {isCreatingAudiobook ? "切分中..." : "创建有声书"}
               </button>
             </div>
           </div>
@@ -1609,7 +1718,9 @@ function AudiobookConsole({
   onDeleteVoice,
   onAutoAnnotate,
   onUpdateSegment,
-  onGenerate
+  onSaveWorkspace,
+  onGenerate,
+  onRetryProduct
 }: {
   workspace: AudiobookWorkspacePayload;
   apiKey: string;
@@ -1620,12 +1731,13 @@ function AudiobookConsole({
   onDeleteVoice: (charId: string) => void;
   onAutoAnnotate: () => Promise<void>;
   onUpdateSegment: (segId: string, patch: { characterId: string | null; characterName: string; emotion: string }) => void;
+  onSaveWorkspace: () => Promise<void>;
   onGenerate: () => Promise<void>;
+  onRetryProduct: (productId: string) => Promise<void>;
 }) {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analyzeProgress, setAnalyzeProgress] = useState(0);
   const [analyzeText, setAnalyzeText] = useState("");
-  const [annotationMode, setAnnotationMode] = useState<"manual" | "auto">("manual");
   const [editingSegId, setEditingSegId] = useState<string | null>(null);
   const [editCharId, setEditCharId] = useState<string>("");
   const [editEmotion, setEditEmotion] = useState("");
@@ -1633,13 +1745,23 @@ function AudiobookConsole({
   const [annotateProgress, setAnnotateProgress] = useState(0);
   const [annotateText, setAnnotateText] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
-  const [generateProgress, setGenerateProgress] = useState(0);
-  const [generateText, setGenerateText] = useState("");
+  const productSectionRef = useRef<HTMLDivElement | null>(null);
   const progressTimerRef = useRef<number | null>(null);
   const runningActionRef = useRef<"analyze" | "annotate" | "generate" | null>(null);
 
   const allVoicesReady = workspace.characters.length > 0 && workspace.characters.every((c) => c.voiceStatus === "ready");
   const hasAnnotations = workspace.segments.some((s) => s.characterId || s.characterName);
+  const showProductSection = isGenerating || workspace.phase === "generation" || workspace.products.length > 0;
+  const allProductsReady = workspace.products.length > 0 && workspace.products.every((product) => product.status === "ready" && product.audioDataUrl);
+
+  useEffect(() => {
+    if (!isGenerating) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      productSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [isGenerating]);
 
   function startProgress(
     setProgress: (v: number) => void,
@@ -1745,28 +1867,47 @@ function AudiobookConsole({
     }
     runningActionRef.current = "generate";
     setIsGenerating(true);
-    setGenerateProgress(0);
-    const totalSegs = workspace.segments.length;
-    startProgress(setGenerateProgress, setGenerateText, [
-      { percent: Math.min(10, 95), text: `准备合成 ${totalSegs} 段音频...` },
-      { percent: Math.min(25, 95), text: "正在合成第 1 段..." },
-      { percent: Math.min(50, 95), text: "合成进行中..." },
-      { percent: Math.min(75, 95), text: "即将完成..." },
-      { percent: 90, text: "收尾处理..." }
-    ]);
     try {
+      await onSaveWorkspace();
       await onGenerate();
-      stopProgress(100, setGenerateProgress);
-      setGenerateText("全部合成完成！");
-    } catch {
-      stopProgress(0, setGenerateProgress);
-      setGenerateText("合成失败，请重试");
+    } catch (error) {
+      console.error("[audiobook:generate] failed", error);
     } finally {
       setTimeout(() => {
         runningActionRef.current = null;
         setIsGenerating(false);
       }, 500);
     }
+  }
+
+  async function handleRetryProduct(productId: string) {
+    await onRetryProduct(productId);
+  }
+
+  async function downloadAudiobookProductsZip() {
+    if (!allProductsReady) {
+      return;
+    }
+
+    const zip = new JSZip();
+    const usedNames = new Map<string, number>();
+    workspace.products.forEach((product, index) => {
+      if (!product.audioDataUrl) {
+        return;
+      }
+      const indexLabel = String(index + 1).padStart(2, "0");
+      const characterName = sanitizeFileName(product.characterName || "旁白").replace(/\.[a-z0-9]{1,8}$/i, "");
+      const fileName = getUniqueFileName(`segment-${indexLabel}-${characterName}.wav`, usedNames);
+      zip.file(fileName, dataUrlToUint8Array(product.audioDataUrl));
+    });
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${sanitizeFileName(workspace.name)}-${formatDateForFile(new Date())}.zip`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   function startEditSegment(segId: string) {
@@ -1879,26 +2020,10 @@ function AudiobookConsole({
             <div className="section-header">
               <h3>文本标注</h3>
               <div className="annotation-controls">
-                <button
-                  className={annotationMode === "manual" ? "mode-btn active" : "mode-btn"}
-                  type="button"
-                  onClick={() => setAnnotationMode("manual")}
-                >
-                  手动标注
+                <button className="run-button" type="button" onClick={() => void handleAutoAnnotate()} disabled={isAnnotating}>
+                  {isAnnotating ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />}
+                  {isAnnotating ? "标注中..." : "AI 自动标注"}
                 </button>
-                <button
-                  className={annotationMode === "auto" ? "mode-btn active" : "mode-btn"}
-                  type="button"
-                  onClick={() => setAnnotationMode("auto")}
-                >
-                  自动标注
-                </button>
-                {annotationMode === "auto" && (
-                  <button className="run-button" type="button" onClick={() => void handleAutoAnnotate()} disabled={isAnnotating}>
-                    {isAnnotating ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />}
-                    {isAnnotating ? "标注中..." : "开始自动标注"}
-                  </button>
-                )}
               </div>
             </div>
 
@@ -1948,23 +2073,7 @@ function AudiobookConsole({
 
             {workspace.phase === "annotation" && hasAnnotations && (
               <>
-                {isGenerating && (
-                  <div className="smart-progress">
-                    <div className="smart-progress-bar">
-                      <div className="smart-progress-fill" style={{ width: `${generateProgress}%` }} />
-                    </div>
-                    <p className="smart-progress-text">{generateText}</p>
-                  </div>
-                )}
-                <button
-                  className="run-button phase-advance"
-                  type="button"
-                  onClick={() => {
-                    onPatch({ phase: "generation" });
-                    void handleGenerate();
-                  }}
-                  disabled={isGenerating}
-                >
+                <button className="run-button phase-advance" type="button" onClick={() => void handleGenerate()} disabled={isGenerating}>
                   {isGenerating ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
                   {isGenerating ? "生成中..." : "一键生成"}
                 </button>
@@ -1974,28 +2083,28 @@ function AudiobookConsole({
         )}
 
         {/* 产物列表区域 */}
-        {workspace.products.length > 0 && (
-          <div className="audiobook-section">
+        {showProductSection && (
+          <div className="audiobook-section" ref={productSectionRef}>
             <div className="section-header">
               <h3>产物列表</h3>
-              <button
-                className="run-button"
-                type="button"
-                onClick={() => void handleGenerate()}
-                disabled={isGenerating}
-              >
-                {isGenerating ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
-                {isGenerating ? "生成中..." : "重新生成"}
-              </button>
-            </div>
-            {isGenerating && (
-              <div className="smart-progress">
-                <div className="smart-progress-bar">
-                  <div className="smart-progress-fill" style={{ width: `${generateProgress}%` }} />
-                </div>
-                <p className="smart-progress-text">{generateText}</p>
+              <div className="product-toolbar">
+                {allProductsReady && (
+                  <button className="run-button" type="button" onClick={() => void downloadAudiobookProductsZip()}>
+                    <Download size={14} />
+                    批量下载 ZIP
+                  </button>
+                )}
+                <button
+                  className="run-button"
+                  type="button"
+                  onClick={() => void handleGenerate()}
+                  disabled={isGenerating}
+                >
+                  {isGenerating ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+                  {isGenerating ? "生成中..." : "重新生成"}
+                </button>
               </div>
-            )}
+            </div>
             <div className="product-list">
               {workspace.products.map((prod, index) => (
                 <div key={prod.id} className="product-item">
@@ -2015,13 +2124,26 @@ function AudiobookConsole({
                       >
                         <Download size={14} />
                       </a>
+                      <button className="icon-button" type="button" onClick={() => void handleRetryProduct(prod.id)} title="重新生成">
+                        <RefreshCw size={14} />
+                      </button>
                     </div>
                   ) : prod.status === "generating" ? (
                     <span className="voice-status generating"><Loader2 className="spin" size={14} /> 合成中...</span>
                   ) : prod.status === "error" ? (
-                    <span className="voice-status error">{prod.error || "失败"}</span>
+                    <div className="product-actions">
+                      <span className="voice-status error">{prod.error || "失败"}</span>
+                      <button className="icon-button" type="button" onClick={() => void handleRetryProduct(prod.id)} title="重试生成">
+                        <RefreshCw size={14} />
+                      </button>
+                    </div>
                   ) : (
-                    <span className="voice-status">等待中</span>
+                    <div className="product-actions">
+                      <span className="voice-status">等待中</span>
+                      <button className="icon-button" type="button" onClick={() => void handleRetryProduct(prod.id)} title="生成当前片段">
+                        <RefreshCw size={14} />
+                      </button>
+                    </div>
                   )}
                 </div>
               ))}
