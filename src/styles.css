@@ -316,6 +316,11 @@ h1 {
   grid-template-columns: 280px 1fr;
   gap: 14px;
   padding: 14px 24px 24px;
+  transition: grid-template-columns 0.3s ease;
+}
+
+.studio-layout:has(.board-sidebar.collapsed) {
+  grid-template-columns: 50px 1fr;
 }
 
 .board-sidebar,
@@ -342,6 +347,44 @@ h1 {
   margin-bottom: 12px;
 }
 
+.sidebar-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin-left: auto;
+  border: 1px solid rgba(197, 164, 93, 0.3);
+  border-radius: 4px;
+  background: rgba(197, 164, 93, 0.1);
+  color: #c5a45d;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.sidebar-toggle:hover {
+  background: rgba(197, 164, 93, 0.25);
+  border-color: rgba(197, 164, 93, 0.5);
+}
+
+.board-sidebar.collapsed {
+  padding: 14px 8px;
+  align-items: center;
+}
+
+.board-sidebar.collapsed .sidebar-title {
+  margin-bottom: 0;
+  writing-mode: vertical-lr;
+  text-orientation: mixed;
+  gap: 12px;
+}
+
+.board-sidebar.collapsed .sidebar-toggle {
+  margin-left: 0;
+  margin-top: auto;
+}
+
 .new-board,
 .board-item,
 .danger.subtle {
@@ -355,6 +398,12 @@ h1 {
   align-content: start;
   gap: 8px;
   margin: 12px 0;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.board-list::-webkit-scrollbar {
+  display: none;
 }
 
 .board-list-entry {

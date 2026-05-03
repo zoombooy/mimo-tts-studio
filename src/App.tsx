@@ -26,6 +26,8 @@ import {
   Archive,
   AudioLines,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Download,
   FileAudio,
   Key,
@@ -221,6 +223,7 @@ function StudioApp() {
   const [apiEndpointInput, setApiEndpointInput] = useState(apiEndpoint);
   const [topbarCollapsed, setTopbarCollapsed] = useState(false);
   const [showDefaultKeyWarning, setShowDefaultKeyWarning] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const topbarHoverTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -903,44 +906,56 @@ function StudioApp() {
       )}
 
       <section className="studio-layout">
-        <aside className="board-sidebar">
+        <aside className={`board-sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
           <div className="sidebar-title">
             <PanelTop size={17} />
             <span>画板库</span>
+            <button
+              className="sidebar-toggle"
+              type="button"
+              onClick={() => setSidebarCollapsed((value) => !value)}
+              title={sidebarCollapsed ? "展开画板库" : "折叠画板库"}
+            >
+              {sidebarCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+            </button>
           </div>
-          <button className="new-board" type="button" onClick={() => setBoardDialog("choice")}>
-            <Plus size={16} />
-            新建画板
-          </button>
-          <div className="board-list">
-            {workspaces.map((workspace) => (
-              <div className="board-list-entry" key={workspace.id}>
-                <button
-                  className={workspace.id === activeWorkspace?.id ? "board-item active" : "board-item"}
-                  type="button"
-                  onClick={() => void loadWorkspace(workspace.id)}
-                >
-                  <strong>{workspace.name}</strong>
-                  <span>
-                    {workspace.nodeCount} 节点 / {workspace.edgeCount} 连线
-                  </span>
-                </button>
-                {workspace.id === activeWorkspace?.id && (activeWorkspace.stashItems?.length ?? 0) > 0 ? (
-                  <StashPanel
-                    isOpen={isStashOpen}
-                    items={activeWorkspace.stashItems ?? []}
-                    onBatchDownload={() => void downloadStashZip()}
-                    onDelete={deleteStashItem}
-                    onToggle={() => setIsStashOpen((value) => !value)}
-                  />
-                ) : null}
+          {!sidebarCollapsed && (
+            <>
+              <button className="new-board" type="button" onClick={() => setBoardDialog("choice")}>
+                <Plus size={16} />
+                新建画板
+              </button>
+              <div className="board-list">
+                {workspaces.map((workspace) => (
+                  <div className="board-list-entry" key={workspace.id}>
+                    <button
+                      className={workspace.id === activeWorkspace?.id ? "board-item active" : "board-item"}
+                      type="button"
+                      onClick={() => void loadWorkspace(workspace.id)}
+                    >
+                      <strong>{workspace.name}</strong>
+                      <span>
+                        {workspace.nodeCount} 节点 / {workspace.edgeCount} 连线
+                      </span>
+                    </button>
+                    {workspace.id === activeWorkspace?.id && (activeWorkspace.stashItems?.length ?? 0) > 0 ? (
+                      <StashPanel
+                        isOpen={isStashOpen}
+                        items={activeWorkspace.stashItems ?? []}
+                        onBatchDownload={() => void downloadStashZip()}
+                        onDelete={deleteStashItem}
+                        onToggle={() => setIsStashOpen((value) => !value)}
+                      />
+                    ) : null}
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-          <button className="danger subtle" type="button" onClick={() => void deleteWorkspace()} disabled={!activeWorkspace}>
-            <Trash2 size={16} />
-            删除当前画板
-          </button>
+              <button className="danger subtle" type="button" onClick={() => void deleteWorkspace()} disabled={!activeWorkspace}>
+                <Trash2 size={16} />
+                删除当前画板
+              </button>
+            </>
+          )}
         </aside>
 
         <section className="canvas-panel">
