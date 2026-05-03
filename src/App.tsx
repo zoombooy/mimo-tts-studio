@@ -1660,7 +1660,7 @@ function ContextMenu({ menu, onAdd }: { menu: { x: number; y: number }; onAdd: (
   return (
     <div className="context-menu" style={{ left: menu.x, top: menu.y }} onClick={(event) => event.stopPropagation()}>
       <strong>添加工作节点</strong>
-      {(Object.keys(nodeCatalog) as StudioNodeType[]).map((type) => (
+      {(Object.keys(nodeCatalog) as StudioNodeType[]).filter((type) => type !== "artifact").map((type) => (
         <button key={type} type="button" onClick={() => onAdd(type)}>
           <span>{nodeCatalog[type].label}</span>
           <small>{nodeCatalog[type].description}</small>
