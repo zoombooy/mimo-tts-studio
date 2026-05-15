@@ -1389,12 +1389,23 @@ a.stash-round-action:hover {
   gap: 8px;
 }
 
+.annotation-controls .run-button {
+  width: auto;
+  margin-top: 0;
+}
+
 .product-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.product-toolbar .run-button {
+  width: auto;
+  min-width: 150px;
+  margin-top: 0;
 }
 
 .segment-list {
@@ -1544,4 +1555,20 @@ a.stash-round-action:hover {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+.product-download-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  text-decoration: none;
+}
+
+.product-download-button:hover {
+  border-color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.14);
 }

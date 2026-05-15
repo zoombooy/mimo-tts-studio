@@ -247,7 +247,7 @@ const nodeCatalog: Record<
   }
 };
 
-const autoSaveDelayMs = 300000;
+const autoSaveDelayMs = 30000;
 const DEFAULT_API_KEY = "sk-cbpjuoes34akq38omkqz9s08s7h9dxwe7cjshz5824kskliz";
 const DEFAULT_API_ENDPOINT = "https://api.xiaomimimo.com/v1/chat/completions";
 const API_KEY_STORAGE_KEY = "mimo-api-key";
@@ -286,6 +286,29 @@ function StudioApp() {
   const [showDefaultKeyWarning, setShowDefaultKeyWarning] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const topbarHoverTimerRef = useRef<number | null>(null);
+
+  const autoSaveKey = useMemo(() => {
+    if (!activeWorkspace) return "";
+    if (activeWorkspace.type === "audiobook") {
+      return JSON.stringify({
+        id: activeWorkspace.id,
+        name: activeWorkspace.name,
+        novelText: activeWorkspace.novelText,
+        characterHints: activeWorkspace.characterHints,
+        characters: activeWorkspace.characters,
+        segments: activeWorkspace.segments,
+        products: activeWorkspace.products,
+        phase: activeWorkspace.phase
+      });
+    }
+    return JSON.stringify({
+      id: activeWorkspace.id,
+      name: activeWorkspace.name,
+      nodes,
+      edges,
+      stashItems: activeWorkspace.stashItems ?? []
+    });
+  }, [activeWorkspace, nodes, edges]);
 
   useEffect(() => {
     void loadStatus();
@@ -333,8 +356,8 @@ function StudioApp() {
         window.clearTimeout(saveTimerRef.current);
       }
     };
-    // 仅监听画布结构、节点数据和暂存列表变化，避免保存函数引用。
-  }, [nodes, edges, activeWorkspace?.type === "board" ? activeWorkspace.stashItems : undefined]);
+    // Track board and audiobook state changes without depending on the save function identity.
+  }, [autoSaveKey]);
 
   const nodeCallbacks = useMemo(
     () => ({
@@ -500,13 +523,16 @@ function StudioApp() {
   }
 
   function patchAudiobook(patch: Partial<AudiobookWorkspacePayload>) {
-    if (!activeWorkspace || activeWorkspace.type !== "audiobook") return;
-    setActiveWorkspace({ ...activeWorkspace, ...patch } as AudiobookWorkspacePayload);
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "audiobook") return workspace;
+      return { ...workspace, ...patch } as AudiobookWorkspacePayload;
+    });
   }
 
   async function analyzeAudiobookCharacters() {
     if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
-    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/characters/analyze`, {
+    const workspaceId = activeWorkspace.id;
+    const response = await fetch(`/api/audiobook/${workspaceId}/characters/analyze`, {
       method: "POST",
       headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
     });
@@ -514,7 +540,10 @@ function StudioApp() {
     if (!response.ok) {
       throw new Error(result.error || "角色分析失败");
     }
-    patchAudiobook({ characters: result.characters ?? [] });
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "audiobook" || workspace.id !== workspaceId) return workspace;
+      return { ...workspace, characters: result.characters ?? [] };
+    });
   }
 
   async function generateCharacterVoice(charId: string) {
@@ -576,7 +605,8 @@ function StudioApp() {
 
   async function autoAnnotateAudiobook() {
     if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
-    const response = await fetch(`/api/audiobook/${activeWorkspace.id}/annotate`, {
+    const workspaceId = activeWorkspace.id;
+    const response = await fetch(`/api/audiobook/${workspaceId}/annotate`, {
       method: "POST",
       headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
     });
@@ -584,7 +614,10 @@ function StudioApp() {
     if (!response.ok) {
       throw new Error(result.error || "自动标注失败");
     }
-    patchAudiobook({ segments: result.segments ?? [], phase: "annotation" });
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "audiobook" || workspace.id !== workspaceId) return workspace;
+      return { ...workspace, segments: result.segments ?? [], phase: "annotation" };
+    });
   }
 
   async function updateAudiobookSegment(segId: string, patch: { characterId: string | null; characterName: string; emotion: string }) {
@@ -598,15 +631,22 @@ function StudioApp() {
     if (!response.ok) {
       throw new Error(result.error || "标注失败");
     }
-    patchAudiobook({
-      segments: activeWorkspace.segments.map((s) => (s.id === segId ? result.segment! : s))
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "audiobook" || workspace.id !== activeWorkspace.id) return workspace;
+      return {
+        ...workspace,
+        segments: workspace.segments.map((s) => (s.id === segId ? result.segment! : s))
+      };
     });
   }
 
   async function generateAudiobookAudio() {
     if (!activeWorkspace || activeWorkspace.type !== "audiobook") throw new Error("工作区状态异常");
     const workspaceId = activeWorkspace.id;
-    patchAudiobook({ phase: "generation" });
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "audiobook" || workspace.id !== workspaceId) return workspace;
+      return { ...workspace, phase: "generation" };
+    });
     const response = await fetch(`/api/audiobook/${workspaceId}/generate`, {
       method: "POST",
       headers: { "X-API-Key": apiKey, "X-API-Endpoint": apiEndpoint }
@@ -615,7 +655,10 @@ function StudioApp() {
     if (!response.ok) {
       throw new Error(result.error || "生成失败");
     }
-    patchAudiobook({ products: result.products ?? [] });
+    setActiveWorkspace((workspace) => {
+      if (!workspace || workspace.type !== "audiobook" || workspace.id !== workspaceId) return workspace;
+      return { ...workspace, products: result.products ?? [] };
+    });
     await pollAudiobookGeneration(workspaceId);
   }
 
@@ -711,7 +754,8 @@ function StudioApp() {
           characters: activeWorkspace.characters,
           segments: activeWorkspace.segments,
           products: activeWorkspace.products,
-          phase: activeWorkspace.phase
+          phase: activeWorkspace.phase,
+          baseUpdatedAt: activeWorkspace.updatedAt
         };
       } else {
         const cleanNodes = nodes.map(stripNodeCallbacks);
@@ -732,7 +776,17 @@ function StudioApp() {
       if (!response.ok) {
         throw new Error(saved.error || `保存失败：HTTP ${response.status}`);
       }
-      setActiveWorkspace(saved);
+      setActiveWorkspace((current) => {
+        if (!current || current.id !== saved.id) return current;
+        if (current.type === "audiobook" && saved.type === "audiobook") {
+          return {
+            ...current,
+            name: saved.name,
+            updatedAt: saved.updatedAt
+          };
+        }
+        return saved;
+      });
       setWorkspaces((items) =>
         items.map((item) =>
           item.id === saved.id
@@ -1751,6 +1805,7 @@ function AudiobookConsole({
 
   const allVoicesReady = workspace.characters.length > 0 && workspace.characters.every((c) => c.voiceStatus === "ready");
   const hasAnnotations = workspace.segments.some((s) => s.characterId || s.characterName);
+  const hasUsedAutoAnnotation = workspace.segments.some((s) => s.isAutoAnnotated);
   const showProductSection = isGenerating || workspace.phase === "generation" || workspace.products.length > 0;
   const allProductsReady = workspace.products.length > 0 && workspace.products.every((product) => product.status === "ready" && product.audioDataUrl);
 
@@ -1832,7 +1887,7 @@ function AudiobookConsole({
   }
 
   async function handleAutoAnnotate() {
-    if (runningActionRef.current) {
+    if (runningActionRef.current || hasUsedAutoAnnotation) {
       return;
     }
     runningActionRef.current = "annotate";
@@ -2020,7 +2075,13 @@ function AudiobookConsole({
             <div className="section-header">
               <h3>文本标注</h3>
               <div className="annotation-controls">
-                <button className="run-button" type="button" onClick={() => void handleAutoAnnotate()} disabled={isAnnotating}>
+                <button
+                  className="run-button"
+                  type="button"
+                  onClick={() => void handleAutoAnnotate()}
+                  disabled={isAnnotating || hasUsedAutoAnnotation}
+                  title={hasUsedAutoAnnotation ? "AI auto annotation can only be used once. Please edit manually." : undefined}
+                >
                   {isAnnotating ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />}
                   {isAnnotating ? "标注中..." : "AI 自动标注"}
                 </button>
@@ -2071,7 +2132,7 @@ function AudiobookConsole({
               ))}
             </div>
 
-            {workspace.phase === "annotation" && hasAnnotations && (
+            {workspace.phase === "annotation" && hasAnnotations && !isGenerating && (
               <>
                 <button className="run-button phase-advance" type="button" onClick={() => void handleGenerate()} disabled={isGenerating}>
                   {isGenerating ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
@@ -2117,7 +2178,7 @@ function AudiobookConsole({
                     <div className="product-actions">
                       <StudioAudioPlayer src={prod.audioDataUrl} />
                       <a
-                        className="icon-button"
+                        className="icon-button product-download-button"
                         href={prod.audioDataUrl}
                         download={`segment-${index + 1}.wav`}
                         title="下载"

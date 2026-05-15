@@ -586,20 +586,22 @@ app.put("/api/workspaces/:id", async (req, res, next) => {
 
       if (current.type === "audiobook") {
         const isGenerating = current.products.some((product) => product.status === "pending" || product.status === "generating");
+        const hasBaseUpdatedAt = typeof req.body?.baseUpdatedAt === "string";
+        const isStaleSave = hasBaseUpdatedAt && req.body.baseUpdatedAt !== current.updatedAt;
         return {
           ...current,
           name: normalizeWorkspaceName(req.body?.name ?? current.name),
           updatedAt: now,
           novelText: req.body?.novelText ?? current.novelText,
           characterHints: req.body?.characterHints ?? current.characterHints,
-          characters: Array.isArray(req.body?.characters) ? req.body.characters : current.characters,
-          segments: Array.isArray(req.body?.segments) ? req.body.segments : current.segments,
-          products: isGenerating
+          characters: !isStaleSave && Array.isArray(req.body?.characters) ? req.body.characters : current.characters,
+          segments: !isStaleSave && Array.isArray(req.body?.segments) ? req.body.segments : current.segments,
+          products: isGenerating || isStaleSave
             ? current.products
             : Array.isArray(req.body?.products)
               ? req.body.products
               : current.products,
-          phase: isGenerating ? "generation" : req.body?.phase ?? current.phase
+          phase: isGenerating ? "generation" : isStaleSave ? current.phase : req.body?.phase ?? current.phase
         };
       }
 
