@@ -113,6 +113,12 @@ type SmartWorkspaceSegment = {
 type AudiobookCharacter = {
   id: string;
   name: string;
+  roleType: "narrator" | "protagonist" | "supporting" | "custom";
+  aliases: string[];
+  voiceSource: "analysis" | "manualDesign" | "manualClone";
+  voiceMode: "designed" | "cloned";
+  isSystem?: boolean;
+  isVoiceLocked?: boolean;
   gender: string;
   age: string;
   voiceTraits: string;
@@ -122,6 +128,9 @@ type AudiobookCharacter = {
   voiceDataUrl: string | null;
   voiceStatus: "pending" | "generating" | "ready" | "error";
   voiceError?: string;
+  referenceAudioDataUrl?: string;
+  referenceAudioFileName?: string;
+  referenceAudioMimeType?: string;
 };
 
 type AudiobookSegment = {
@@ -148,6 +157,18 @@ type AudiobookProduct = {
   synthesisMethod: "voiceClone" | "voiceDesign";
 };
 
+type AudiobookChapter = {
+  id: string;
+  title: string;
+  novelText: string;
+  characterHints: string;
+  segments: AudiobookSegment[];
+  products: AudiobookProduct[];
+  phase: "character-creation" | "annotation" | "generation";
+  createdAt: string;
+  updatedAt: string;
+};
+
 type StoredBoardWorkspace = {
   id: string;
   type: "board";
@@ -166,12 +187,14 @@ type StoredAudiobookWorkspace = {
   name: string;
   createdAt: string;
   updatedAt: string;
+  activeChapterId: string;
   novelText: string;
   characterHints: string;
   characters: AudiobookCharacter[];
   segments: AudiobookSegment[];
   products: AudiobookProduct[];
   phase: "character-creation" | "annotation" | "generation";
+  chapters: AudiobookChapter[];
 };
 
 type StoredWorkspace = StoredBoardWorkspace | StoredAudiobookWorkspace;
@@ -586,23 +609,32 @@ app.put("/api/workspaces/:id", async (req, res, next) => {
       const now = new Date().toISOString();
 
       if (current.type === "audiobook") {
-        const isGenerating = current.products.some((product) => product.status === "pending" || product.status === "generating");
+        const chapter = getActiveAudiobookChapter(current);
+        const isGenerating = chapter.products.some((product) => product.status === "pending" || product.status === "generating");
         const hasBaseUpdatedAt = typeof req.body?.baseUpdatedAt === "string";
         const isStaleSave = hasBaseUpdatedAt && req.body.baseUpdatedAt !== current.updatedAt;
+        const nextCharacters = !isStaleSave && Array.isArray(req.body?.characters)
+          ? ensureNarratorCharacter(req.body.characters)
+          : current.characters;
+        if (!isStaleSave) {
+          chapter.novelText = String(req.body?.novelText ?? chapter.novelText);
+          chapter.characterHints = String(req.body?.characterHints ?? chapter.characterHints);
+          chapter.segments = Array.isArray(req.body?.segments) ? req.body.segments : chapter.segments;
+          chapter.products = isGenerating
+            ? chapter.products
+            : Array.isArray(req.body?.products)
+              ? req.body.products
+              : chapter.products;
+          chapter.phase = isGenerating ? "generation" : req.body?.phase ?? chapter.phase;
+          chapter.updatedAt = now;
+        }
+        current.characters = nextCharacters;
+        syncAudiobookWorkspaceFromChapter(current, chapter);
         return {
           ...current,
           name: normalizeWorkspaceName(req.body?.name ?? current.name),
           updatedAt: now,
-          novelText: req.body?.novelText ?? current.novelText,
-          characterHints: req.body?.characterHints ?? current.characterHints,
-          characters: !isStaleSave && Array.isArray(req.body?.characters) ? req.body.characters : current.characters,
-          segments: !isStaleSave && Array.isArray(req.body?.segments) ? req.body.segments : current.segments,
-          products: isGenerating || isStaleSave
-            ? current.products
-            : Array.isArray(req.body?.products)
-              ? req.body.products
-              : current.products,
-          phase: isGenerating ? "generation" : isStaleSave ? current.phase : req.body?.phase ?? current.phase
+          phase: isGenerating ? "generation" : isStaleSave ? current.phase : current.phase
         };
       }
 
@@ -666,6 +698,17 @@ app.post("/api/audiobook", async (req, res, next) => {
       emotion: "",
       isAutoAnnotated: false
     }));
+    const chapter: AudiobookChapter = {
+      id: createId("chapter"),
+      title: String(req.body?.chapterTitle || "章节 1"),
+      novelText,
+      characterHints,
+      segments,
+      products: [],
+      phase: "character-creation",
+      createdAt: now,
+      updatedAt: now
+    };
 
     const workspace: StoredAudiobookWorkspace = {
       id: `book-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
@@ -673,18 +716,261 @@ app.post("/api/audiobook", async (req, res, next) => {
       name: req.body?.name || `有声书 ${new Date().toLocaleString("zh-CN", { hour12: false })}`,
       createdAt: now,
       updatedAt: now,
+      activeChapterId: chapter.id,
       novelText,
       characterHints,
-      characters: [],
+      characters: [createAudiobookNarrator(now)],
       segments,
       products: [],
-      phase: "character-creation"
+      phase: "character-creation",
+      chapters: [chapter]
     };
 
     store.workspaces.unshift(workspace);
     store.activeWorkspaceId = workspace.id;
     await writeWorkspaceStore(store);
     res.status(201).json(workspace);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/chapters", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const novelText = String(req.body?.novelText || "").trim();
+    const characterHints = String(req.body?.characterHints || "").trim();
+    if (!novelText) {
+      return res.status(400).json({ error: "小说原文不能为空。" });
+    }
+
+    const { apiKey, apiEndpoint } = getApiConfig(req);
+    if (!apiKey) {
+      return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    const now = new Date().toISOString();
+    const segmentedTexts = await segmentAudiobookText(novelText, apiKey, apiEndpoint);
+    const chapter: AudiobookChapter = {
+      id: createId("chapter"),
+      title: String(req.body?.title || `章节 ${workspace.chapters.length + 1}`),
+      novelText,
+      characterHints,
+      segments: segmentedTexts.map((text: string, index: number) => ({
+        id: `seg-${Date.now().toString(36)}-${index}`,
+        text,
+        characterId: null,
+        characterName: "",
+        emotion: "",
+        isAutoAnnotated: false
+      })),
+      products: [],
+      phase: "character-creation",
+      createdAt: now,
+      updatedAt: now
+    };
+    workspace.chapters.push(chapter);
+    workspace.activeChapterId = chapter.id;
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
+    workspace.updatedAt = now;
+    await writeWorkspaceStore(store);
+    res.status(201).json({ workspace, chapter });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/audiobook/:id/chapters/:chapterId", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const chapter = workspace.chapters.find((item) => item.id === req.params.chapterId);
+    if (!chapter) {
+      return res.status(404).json({ error: "章节不存在。" });
+    }
+
+    const nextNovelText = typeof req.body?.novelText === "string" ? req.body.novelText.trim() : chapter.novelText;
+    const shouldResegment = nextNovelText !== chapter.novelText;
+    if (shouldResegment && !nextNovelText) {
+      return res.status(400).json({ error: "小说原文不能为空。" });
+    }
+
+    if (shouldResegment) {
+      const { apiKey, apiEndpoint } = getApiConfig(req);
+      if (!apiKey) {
+        return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+      }
+      const segmentedTexts = await segmentAudiobookText(nextNovelText, apiKey, apiEndpoint);
+      chapter.novelText = nextNovelText;
+      chapter.segments = segmentedTexts.map((text: string, index: number) => ({
+        id: `seg-${Date.now().toString(36)}-${index}`,
+        text,
+        characterId: null,
+        characterName: "",
+        emotion: "",
+        isAutoAnnotated: false
+      }));
+      chapter.products = [];
+      chapter.phase = "character-creation";
+    }
+
+    chapter.title = String(req.body?.title || chapter.title);
+    chapter.characterHints = typeof req.body?.characterHints === "string" ? req.body.characterHints : chapter.characterHints;
+    chapter.updatedAt = new Date().toISOString();
+    workspace.activeChapterId = chapter.id;
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
+    workspace.updatedAt = chapter.updatedAt;
+    await writeWorkspaceStore(store);
+    res.json({ workspace, chapter });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/chapters/:chapterId/activate", async (req, res, next) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+    const chapter = workspace.chapters.find((item) => item.id === req.params.chapterId);
+    if (!chapter) {
+      return res.status(404).json({ error: "章节不存在。" });
+    }
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStore(store);
+    res.json({ workspace, chapter });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/audiobook/:id/characters", upload.single("voice"), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const store = await readWorkspaceStore();
+    const workspace = store.workspaces.find((w) => w.id === req.params.id);
+    if (!workspace || workspace.type !== "audiobook") {
+      return res.status(404).json({ error: "有声书工作区不存在。" });
+    }
+
+    const name = String(req.body?.name || "").trim();
+    if (!name) {
+      return res.status(400).json({ error: "角色名称不能为空。" });
+    }
+
+    const voiceMime = req.file ? resolveVoiceMimeType(req.file) : null;
+    if (req.file && !voiceMime) {
+      return res.status(400).json({ error: "仅支持 mp3、m4a/mp4 或 wav 参考音频。" });
+    }
+
+    const referenceAudioDataUrl = req.file && voiceMime ? `data:${voiceMime};base64,${req.file.buffer.toString("base64")}` : undefined;
+    const rawRoleType = String(req.body?.roleType || "");
+    const requestedRoleType: AudiobookCharacter["roleType"] | "" =
+      rawRoleType === "narrator" || rawRoleType === "protagonist" || rawRoleType === "supporting" || rawRoleType === "custom"
+        ? rawRoleType
+        : "";
+    const existingNarrator = (requestedRoleType === "narrator" || name === "旁白")
+      ? workspace.characters.find((item) => item.roleType === "narrator" || item.name === "旁白")
+      : undefined;
+    if (existingNarrator) {
+      existingNarrator.aliases = String(req.body?.aliases || "").split(/[,，、;；\n]/).map((item) => item.trim()).filter(Boolean);
+      existingNarrator.voiceTraits = String(req.body?.voiceTraits || existingNarrator.voiceTraits);
+      existingNarrator.personality = String(req.body?.personality || existingNarrator.personality);
+      existingNarrator.voiceDescription = String(req.body?.voiceDescription || existingNarrator.voiceDescription);
+      existingNarrator.voiceSource = referenceAudioDataUrl ? "manualClone" : "manualDesign";
+      existingNarrator.voiceMode = referenceAudioDataUrl ? "cloned" : "designed";
+      if (referenceAudioDataUrl) {
+        existingNarrator.voiceDataUrl = referenceAudioDataUrl;
+        existingNarrator.referenceAudioDataUrl = referenceAudioDataUrl;
+        existingNarrator.referenceAudioFileName = req.file?.originalname;
+        existingNarrator.referenceAudioMimeType = voiceMime ?? undefined;
+        existingNarrator.voiceStatus = "ready";
+        existingNarrator.voiceError = undefined;
+        existingNarrator.isVoiceLocked = true;
+      }
+      workspace.characters = ensureNarratorCharacter(workspace.characters);
+      workspace.updatedAt = new Date().toISOString();
+      await writeWorkspaceStore(store);
+      return res.json({ character: existingNarrator, characters: workspace.characters });
+    }
+
+    const character = normalizeAudiobookCharacter({
+      id: createId("char"),
+      name,
+      roleType: requestedRoleType || undefined,
+      aliases: String(req.body?.aliases || "").split(/[,，、;；\n]/).map((item) => item.trim()).filter(Boolean),
+      voiceSource: referenceAudioDataUrl ? "manualClone" : "manualDesign",
+      voiceMode: referenceAudioDataUrl ? "cloned" : "designed",
+      gender: req.body?.gender,
+      age: req.body?.age,
+      voiceTraits: req.body?.voiceTraits,
+      personality: req.body?.personality,
+      voiceDescription: req.body?.voiceDescription,
+      voiceDataUrl: referenceAudioDataUrl ?? null,
+      voiceStatus: referenceAudioDataUrl ? "ready" : "pending",
+      referenceAudioDataUrl,
+      referenceAudioFileName: req.file?.originalname,
+      referenceAudioMimeType: voiceMime ?? undefined,
+      isVoiceLocked: Boolean(referenceAudioDataUrl)
+    });
+
+    workspace.characters = ensureNarratorCharacter([...workspace.characters, character]);
+    workspace.updatedAt = new Date().toISOString();
+    await writeWorkspaceStore(store);
+    res.status(201).json({ character, characters: workspace.characters });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/audiobook/:id/characters/:charId", upload.single("voice"), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const updatedCharacter = await updateAudiobookCharacter(String(req.params.id), String(req.params.charId), (target) => {
+      const voiceMime = req.file ? resolveVoiceMimeType(req.file) : null;
+      if (req.file && !voiceMime) {
+        throw Object.assign(new Error("仅支持 mp3、m4a/mp4 或 wav 参考音频。"), { status: 400 });
+      }
+      if (!target.isSystem) {
+        target.name = String(req.body?.name || target.name).trim() || target.name;
+        const nextRoleType = String(req.body?.roleType || "");
+        if (nextRoleType === "narrator" || nextRoleType === "protagonist" || nextRoleType === "supporting" || nextRoleType === "custom") {
+          target.roleType = nextRoleType;
+        }
+      }
+      target.aliases = typeof req.body?.aliases === "string"
+        ? String(req.body.aliases).split(/[,，、;；\n]/).map((item: string) => item.trim()).filter(Boolean)
+        : target.aliases;
+      target.gender = req.body?.gender ?? target.gender;
+      target.age = req.body?.age ?? target.age;
+      target.voiceTraits = req.body?.voiceTraits ?? target.voiceTraits;
+      target.personality = req.body?.personality ?? target.personality;
+      target.voiceDescription = req.body?.voiceDescription ?? target.voiceDescription;
+      target.isVoiceLocked = req.body?.isVoiceLocked === "true" || req.body?.isVoiceLocked === true;
+      if (req.file && voiceMime) {
+        const dataUrl = `data:${voiceMime};base64,${req.file.buffer.toString("base64")}`;
+        target.voiceSource = "manualClone";
+        target.voiceMode = "cloned";
+        target.voiceDataUrl = dataUrl;
+        target.referenceAudioDataUrl = dataUrl;
+        target.referenceAudioFileName = req.file.originalname;
+        target.referenceAudioMimeType = voiceMime;
+        target.voiceStatus = "ready";
+        target.voiceError = undefined;
+        target.isVoiceLocked = true;
+      }
+    });
+    res.json({ character: updatedCharacter });
   } catch (error) {
     next(error);
   }
@@ -702,6 +988,7 @@ app.post("/api/audiobook/:id/characters/analyze", async (req, res, next) => {
     if (!apiKey) {
       return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
     }
+    const chapter = getActiveAudiobookChapter(workspace);
 
     const systemPrompt = `你是一位专业的有声书制作导演和角色分析师。
 你的任务是从小说原文中识别出所有出场人物，并为每个人物生成音色描述。
@@ -721,10 +1008,10 @@ app.post("/api/audiobook/:id/characters/analyze", async (req, res, next) => {
 JSON结构：{"characters":[{"name":"string","personality":"string","voiceDescription":"string"}]}`;
 
     const userMessage = `用户提供的关键人物背景信息：
-${workspace.characterHints || "（无）"}
+${chapter.characterHints || "（无）"}
 
 小说原文：
-${workspace.novelText}
+${chapter.novelText}
 
 请分析出场人物并生成音色描述。`;
 
@@ -771,7 +1058,7 @@ ${workspace.novelText}
     }
 
     // 匹配用户hints中的角色信息
-    const hintsLines = workspace.characterHints.split("\n").filter(Boolean);
+    const hintsLines = chapter.characterHints.split("\n").filter(Boolean);
     const hintMap = new Map<string, { gender: string; age: string; voiceTraits: string }>();
     for (const line of hintsLines) {
       const parts = line.split(/[,，、;；]/).map((s: string) => s.trim());
@@ -785,11 +1072,30 @@ ${workspace.novelText}
       }
     }
 
-    const characters: AudiobookCharacter[] = charactersData.map((c, index) => {
+    const nextCharacters = ensureNarratorCharacter(workspace.characters);
+    for (const c of charactersData) {
       const hint = hintMap.get(c.name);
-      return {
-        id: `char-${Date.now().toString(36)}-${index}`,
+      const matched = nextCharacters.find((character) =>
+        character.name === c.name || character.aliases.includes(c.name)
+      );
+      if (matched) {
+        matched.personality = c.personality || matched.personality;
+        if (!matched.isVoiceLocked && !matched.voiceDataUrl) {
+          matched.gender = hint?.gender || matched.gender;
+          matched.age = hint?.age || matched.age;
+          matched.voiceTraits = hint?.voiceTraits || matched.voiceTraits;
+          matched.voiceDescription = c.voiceDescription || matched.voiceDescription;
+        }
+        continue;
+      }
+      nextCharacters.push({
+        id: `char-${Date.now().toString(36)}-${nextCharacters.length}`,
         name: c.name,
+        roleType: nextCharacters.length === 1 ? "protagonist" : "supporting",
+        aliases: [],
+        voiceSource: "analysis",
+        voiceMode: "designed",
+        isVoiceLocked: false,
         gender: hint?.gender || "",
         age: hint?.age || "",
         voiceTraits: hint?.voiceTraits || "",
@@ -798,15 +1104,17 @@ ${workspace.novelText}
         voiceSampleText: undefined,
         voiceDataUrl: null,
         voiceStatus: "pending" as const
-      };
-    });
+      });
+    }
 
-    // 更新workspace
-    workspace.characters = characters;
+    workspace.characters = nextCharacters;
+    chapter.phase = "character-creation";
+    chapter.updatedAt = new Date().toISOString();
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
     workspace.updatedAt = new Date().toISOString();
     await writeWorkspaceStore(store);
 
-    res.json({ characters });
+    res.json({ characters: workspace.characters, chapter });
   } catch (error) {
     next(error);
   }
@@ -828,6 +1136,16 @@ app.post("/api/audiobook/:id/characters/:charId/voice", async (req, res, next) =
     const { apiKey, apiEndpoint } = getApiConfig(req);
     if (!apiKey) {
       return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
+    }
+
+    if (character.voiceMode === "cloned" && character.referenceAudioDataUrl) {
+      const updatedCharacter = await updateAudiobookCharacter(req.params.id, req.params.charId, (target) => {
+        target.voiceDataUrl = character.referenceAudioDataUrl || target.voiceDataUrl;
+        target.voiceStatus = "ready";
+        target.voiceError = undefined;
+        target.isVoiceLocked = true;
+      });
+      return res.json({ character: updatedCharacter });
     }
 
     await updateAudiobookCharacter(req.params.id, req.params.charId, (target) => {
@@ -941,8 +1259,9 @@ app.post("/api/audiobook/:id/annotate", async (req, res, next) => {
       return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
     }
 
-    const characterList = workspace.characters.map((c) => `${c.name}：${c.personality}`).join("\n");
-    const segmentList = workspace.segments.map((s, i) => `第${i + 1}段：${s.text}`).join("\n\n");
+    const chapter = getActiveAudiobookChapter(workspace);
+    const characterList = workspace.characters.map((c) => `${c.name}${c.aliases.length ? `（别名：${c.aliases.join("、")}）` : ""}：${c.personality || c.voiceDescription}`).join("\n");
+    const segmentList = chapter.segments.map((s, i) => `第${i + 1}段：${s.text}`).join("\n\n");
 
     const systemPrompt = `你是一位专业的有声书配音导演。
 你的任务是为小说的每个文段标注：说话角色和朗读情绪/语气指导。
@@ -1002,24 +1321,29 @@ ${segmentList}
       return res.status(502).json({ error: "无法解析LLM返回的JSON", raw: content });
     }
 
-    const charMap = new Map(workspace.characters.map((c) => [c.name, c]));
+    const narrator = workspace.characters.find((c) => c.roleType === "narrator" || c.name === "旁白");
 
     for (const ann of annotations) {
       const segIndex = ann.index - 1;
-      if (segIndex >= 0 && segIndex < workspace.segments.length) {
-        const seg = workspace.segments[segIndex];
-        const matchedChar = charMap.get(ann.characterName);
+      if (segIndex >= 0 && segIndex < chapter.segments.length) {
+        const seg = chapter.segments[segIndex];
+        const matchedChar = ann.characterName === "旁白"
+          ? narrator
+          : findAudiobookCharacterByNameOrAlias(workspace, ann.characterName);
         seg.characterId = matchedChar?.id || null;
-        seg.characterName = ann.characterName;
+        seg.characterName = matchedChar?.name || ann.characterName;
         seg.emotion = ann.emotion;
         seg.isAutoAnnotated = true;
       }
     }
 
+    chapter.phase = "annotation";
+    chapter.updatedAt = new Date().toISOString();
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
     workspace.updatedAt = new Date().toISOString();
     await writeWorkspaceStore(store);
 
-    res.json({ segments: workspace.segments });
+    res.json({ segments: chapter.segments, chapter });
   } catch (error) {
     next(error);
   }
@@ -1033,7 +1357,8 @@ app.put("/api/audiobook/:id/segments/:segId", async (req, res, next) => {
       return res.status(404).json({ error: "有声书工作区不存在。" });
     }
 
-    const segment = workspace.segments.find((s) => s.id === req.params.segId);
+    const chapter = getActiveAudiobookChapter(workspace);
+    const segment = chapter.segments.find((s) => s.id === req.params.segId);
     if (!segment) {
       return res.status(404).json({ error: "段落不存在。" });
     }
@@ -1042,6 +1367,8 @@ app.put("/api/audiobook/:id/segments/:segId", async (req, res, next) => {
     segment.characterName = req.body?.characterName ?? segment.characterName;
     segment.emotion = req.body?.emotion ?? segment.emotion;
     segment.isAutoAnnotated = false;
+    chapter.updatedAt = new Date().toISOString();
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
     workspace.updatedAt = new Date().toISOString();
     await writeWorkspaceStore(store);
 
@@ -1064,13 +1391,15 @@ app.post("/api/audiobook/:id/generate", async (req, res, next) => {
       return res.status(500).json({ error: "MIMO_API_KEY is not configured." });
     }
 
-    const hasInProgressProducts = workspace.products.some((product) => product.status === "pending" || product.status === "generating");
+    const chapter = getActiveAudiobookChapter(workspace);
+    const hasInProgressProducts = chapter.products.some((product) => product.status === "pending" || product.status === "generating");
     if (hasInProgressProducts) {
       const products = activeAudiobookGenerationJobs.has(req.params.id)
-        ? workspace.products
+        ? chapter.products
         : await updateAudiobookProducts(req.params.id, (targetWorkspace) => {
+          const targetChapter = getActiveAudiobookChapter(targetWorkspace);
           const now = new Date().toISOString();
-          for (const product of targetWorkspace.products) {
+          for (const product of targetChapter.products) {
             if (product.status === "generating") {
               product.status = "pending";
               product.error = undefined;
@@ -1078,8 +1407,10 @@ app.post("/api/audiobook/:id/generate", async (req, res, next) => {
               product.createdAt = now;
             }
           }
-          targetWorkspace.phase = "generation";
-          return targetWorkspace.products.map((product) => ({ ...product }));
+          targetChapter.phase = "generation";
+          targetChapter.updatedAt = now;
+          syncAudiobookWorkspaceFromChapter(targetWorkspace, targetChapter);
+          return targetChapter.products.map((product) => ({ ...product }));
         });
 
       startAudiobookGenerationJob(req.params.id, apiKey, apiEndpoint);
@@ -1088,21 +1419,27 @@ app.post("/api/audiobook/:id/generate", async (req, res, next) => {
 
     const products = await updateAudiobookProducts(req.params.id, (targetWorkspace) => {
       const charMap = new Map(targetWorkspace.characters.map((c) => [c.id, c]));
+      const targetChapter = getActiveAudiobookChapter(targetWorkspace);
       const now = new Date().toISOString();
-      targetWorkspace.products = targetWorkspace.segments.map((seg) => ({
+      targetChapter.products = targetChapter.segments.map((seg) => {
+        const character = seg.characterId ? charMap.get(seg.characterId) : undefined;
+        return ({
         id: `prod-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
         segmentId: seg.id,
         characterId: seg.characterId,
-        characterName: seg.characterName || "旁白",
+        characterName: character?.name || seg.characterName || "未绑定角色",
         text: seg.text,
         instruction: seg.emotion || "自然地朗读",
         audioDataUrl: null,
         status: "pending" as const,
         createdAt: now,
-        synthesisMethod: (seg.characterId && charMap.get(seg.characterId)?.voiceDataUrl) ? "voiceClone" as const : "voiceDesign" as const
-      }));
-      targetWorkspace.phase = "generation";
-      return targetWorkspace.products.map((product) => ({ ...product }));
+        synthesisMethod: "voiceClone" as const
+      });
+      });
+      targetChapter.phase = "generation";
+      targetChapter.updatedAt = now;
+      syncAudiobookWorkspaceFromChapter(targetWorkspace, targetChapter);
+      return targetChapter.products.map((product) => ({ ...product }));
     });
 
     startAudiobookGenerationJob(req.params.id, apiKey, apiEndpoint);
@@ -2250,13 +2587,16 @@ async function generateAudiobookProductsInBatches(workspaceId: string, apiKey: s
 
   while (true) {
     const batch = await updateAudiobookProducts(workspaceId, (workspace) => {
-      const pending = workspace.products.filter((product) => product.status === "pending").slice(0, batchSize);
+      const chapter = getActiveAudiobookChapter(workspace);
+      const pending = chapter.products.filter((product) => product.status === "pending").slice(0, batchSize);
       const startedAt = new Date().toISOString();
       for (const product of pending) {
         product.status = "generating";
         product.error = undefined;
         product.createdAt = startedAt;
       }
+      chapter.updatedAt = startedAt;
+      syncAudiobookWorkspaceFromChapter(workspace, chapter);
       return pending.map((product) => ({ ...product }));
     });
 
@@ -2293,49 +2633,21 @@ async function synthesizeAudiobookProduct(
   apiKey: string,
   apiEndpoint: string
 ): Promise<string> {
-  if (product.synthesisMethod === "voiceClone") {
-    const character = await getAudiobookCharacterSnapshot(workspaceId, product.characterId);
-    if (!character?.voiceDataUrl) {
-      throw new Error("角色音色数据不存在");
-    }
-
-    const payload: MimoPayload = {
-      model: "mimo-v2.5-tts-voiceclone",
-      messages: [
-        { role: "user", content: product.instruction },
-        { role: "assistant", content: product.text }
-      ],
-      audio: {
-        format: "wav",
-        voice: character.voiceDataUrl
-      }
-    };
-
-    const { response: upstreamResponse, text: responseText } = await fetchTextWithTimeout(apiEndpoint, {
-      method: "POST",
-      headers: { "api-key": apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    }, audiobookProductTimeoutMs);
-    if (!upstreamResponse.ok) {
-      throw new Error(`voiceclone失败：HTTP ${upstreamResponse.status}`);
-    }
-
-    const audioData = extractAudioData(parseJson(responseText));
-    if (!audioData) {
-      throw new Error("voiceclone响应中没有音频数据");
-    }
-
-    return `data:audio/wav;base64,${audioData}`;
+  const character = await getAudiobookCharacterSnapshot(workspaceId, product.characterId);
+  if (!character?.voiceDataUrl) {
+    throw new Error(`${product.characterName || "当前角色"}缺少可复用音色，请先在音色库生成或上传参考音频。`);
   }
 
-  const voiceDescription = "自然、清晰的中文旁白音色，语速适中，语气沉稳。";
-  const payload: MimoVoiceDesignPayload = {
-    model: "mimo-v2.5-tts-voicedesign",
+  const payload: MimoPayload = {
+    model: "mimo-v2.5-tts-voiceclone",
     messages: [
-      { role: "user", content: voiceDescription },
+      { role: "user", content: product.instruction },
       { role: "assistant", content: product.text }
     ],
-    audio: { format: "wav" }
+    audio: {
+      format: "wav",
+      voice: character.voiceDataUrl
+    }
   };
 
   const { response: upstreamResponse, text: responseText } = await fetchTextWithTimeout(apiEndpoint, {
@@ -2344,12 +2656,12 @@ async function synthesizeAudiobookProduct(
     body: JSON.stringify(payload)
   }, audiobookProductTimeoutMs);
   if (!upstreamResponse.ok) {
-    throw new Error(`voicedesign失败：HTTP ${upstreamResponse.status}`);
+    throw new Error(`voiceclone失败：HTTP ${upstreamResponse.status}`);
   }
 
   const audioData = extractAudioData(parseJson(responseText));
   if (!audioData) {
-    throw new Error("voicedesign响应中没有音频数据");
+    throw new Error("voiceclone响应中没有音频数据");
   }
 
   return `data:audio/wav;base64,${audioData}`;
@@ -2376,11 +2688,14 @@ async function updateAudiobookProduct(
   update: (product: AudiobookProduct, workspace: StoredAudiobookWorkspace) => void
 ): Promise<AudiobookProduct> {
   const product = await updateAudiobookProducts(workspaceId, (workspace) => {
-    const target = workspace.products.find((item) => item.id === productId);
+    const chapter = getActiveAudiobookChapter(workspace);
+    const target = chapter.products.find((item) => item.id === productId);
     if (!target) {
       throw Object.assign(new Error("Audiobook product not found."), { status: 404 });
     }
     update(target, workspace);
+    chapter.updatedAt = new Date().toISOString();
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
     return { ...target };
   });
   return product;
@@ -2395,6 +2710,8 @@ async function updateAudiobookProducts<T>(workspaceId: string, update: (workspac
     }
 
     const result = update(workspace);
+    const chapter = getActiveAudiobookChapter(workspace);
+    syncAudiobookWorkspaceFromChapter(workspace, chapter);
     workspace.updatedAt = new Date().toISOString();
     await writeWorkspaceStoreNow(store);
     return result;
@@ -2475,23 +2792,173 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createAudiobookNarrator(now = new Date().toISOString()): AudiobookCharacter {
+  void now;
+  return {
+    id: createId("narrator"),
+    name: "旁白",
+    roleType: "narrator",
+    aliases: ["叙述者", "Narrator"],
+    voiceSource: "manualDesign",
+    voiceMode: "designed",
+    isSystem: true,
+    isVoiceLocked: false,
+    gender: "",
+    age: "",
+    voiceTraits: "自然、清晰的中文旁白音色，适合长篇叙述。",
+    personality: "负责小说叙述、场景描写和人物动作说明，表达稳定清晰。",
+    voiceDescription: "自然、清晰的中文旁白音色，声音稳定耐听，适合长篇小说叙述。",
+    voiceSampleText: undefined,
+    voiceDataUrl: null,
+    voiceStatus: "pending"
+  };
+}
+
+function normalizeAudiobookCharacter(raw: Partial<AudiobookCharacter> & Record<string, unknown>): AudiobookCharacter {
+  const name = String(raw.name || "").trim() || "未命名角色";
+  const roleType = raw.roleType === "narrator" || raw.roleType === "protagonist" || raw.roleType === "supporting" || raw.roleType === "custom"
+    ? raw.roleType
+    : name === "旁白"
+      ? "narrator"
+      : "supporting";
+  const voiceSource = raw.voiceSource === "manualDesign" || raw.voiceSource === "manualClone" || raw.voiceSource === "analysis"
+    ? raw.voiceSource
+    : roleType === "narrator"
+      ? "manualDesign"
+      : "analysis";
+  const voiceMode = raw.voiceMode === "cloned" || raw.voiceMode === "designed"
+    ? raw.voiceMode
+    : raw.referenceAudioDataUrl
+      ? "cloned"
+      : "designed";
+  const voiceStatus = raw.voiceStatus === "generating" || raw.voiceStatus === "ready" || raw.voiceStatus === "error"
+    ? raw.voiceStatus
+    : raw.voiceDataUrl
+      ? "ready"
+      : "pending";
+
+  return {
+    id: String(raw.id || createId(roleType === "narrator" ? "narrator" : "char")),
+    name,
+    roleType,
+    aliases: Array.isArray(raw.aliases) ? raw.aliases.map((item) => String(item).trim()).filter(Boolean) : [],
+    voiceSource,
+    voiceMode,
+    isSystem: Boolean(raw.isSystem || roleType === "narrator"),
+    isVoiceLocked: Boolean(raw.isVoiceLocked),
+    gender: String(raw.gender || ""),
+    age: String(raw.age || ""),
+    voiceTraits: String(raw.voiceTraits || ""),
+    personality: String(raw.personality || ""),
+    voiceDescription: String(raw.voiceDescription || (roleType === "narrator" ? "自然、清晰的中文旁白音色，声音稳定耐听，适合长篇小说叙述。" : "")),
+    voiceSampleText: typeof raw.voiceSampleText === "string" ? raw.voiceSampleText : undefined,
+    voiceDataUrl: typeof raw.voiceDataUrl === "string" ? raw.voiceDataUrl : null,
+    voiceStatus,
+    voiceError: typeof raw.voiceError === "string" ? raw.voiceError : undefined,
+    referenceAudioDataUrl: typeof raw.referenceAudioDataUrl === "string" ? raw.referenceAudioDataUrl : undefined,
+    referenceAudioFileName: typeof raw.referenceAudioFileName === "string" ? raw.referenceAudioFileName : undefined,
+    referenceAudioMimeType: typeof raw.referenceAudioMimeType === "string" ? raw.referenceAudioMimeType : undefined
+  };
+}
+
+function ensureNarratorCharacter(characters: AudiobookCharacter[]): AudiobookCharacter[] {
+  const normalized = characters.map((item) => normalizeAudiobookCharacter(item));
+  if (normalized.some((item) => item.roleType === "narrator" || item.name === "旁白")) {
+    return normalized.map((item) => item.roleType === "narrator" || item.name === "旁白"
+      ? { ...item, name: "旁白", roleType: "narrator", isSystem: true }
+      : item);
+  }
+  return [createAudiobookNarrator(), ...normalized];
+}
+
+function normalizeAudiobookChapter(raw: Partial<AudiobookChapter> & Record<string, unknown>, fallbackTitle: string): AudiobookChapter {
+  const now = new Date().toISOString();
+  return {
+    id: String(raw.id || createId("chapter")),
+    title: String(raw.title || fallbackTitle || "未命名章节"),
+    novelText: String(raw.novelText || ""),
+    characterHints: String(raw.characterHints || ""),
+    segments: Array.isArray(raw.segments) ? raw.segments as AudiobookSegment[] : [],
+    products: Array.isArray(raw.products) ? raw.products as AudiobookProduct[] : [],
+    phase: (raw.phase as AudiobookChapter["phase"]) || "character-creation",
+    createdAt: String(raw.createdAt || now),
+    updatedAt: String(raw.updatedAt || now)
+  };
+}
+
+function getActiveAudiobookChapter(workspace: StoredAudiobookWorkspace): AudiobookChapter {
+  let chapter = workspace.chapters.find((item) => item.id === workspace.activeChapterId);
+  if (!chapter) {
+    chapter = workspace.chapters[0];
+    workspace.activeChapterId = chapter.id;
+  }
+  syncAudiobookWorkspaceFromChapter(workspace, chapter);
+  return chapter;
+}
+
+function syncAudiobookWorkspaceFromChapter(workspace: StoredAudiobookWorkspace, chapter = getActiveAudiobookChapterUnsafe(workspace)): void {
+  if (!chapter) {
+    return;
+  }
+  workspace.activeChapterId = chapter.id;
+  workspace.novelText = chapter.novelText;
+  workspace.characterHints = chapter.characterHints;
+  workspace.segments = chapter.segments;
+  workspace.products = chapter.products;
+  workspace.phase = chapter.phase;
+}
+
+function getActiveAudiobookChapterUnsafe(workspace: StoredAudiobookWorkspace): AudiobookChapter | undefined {
+  return workspace.chapters.find((item) => item.id === workspace.activeChapterId) ?? workspace.chapters[0];
+}
+
+function findAudiobookCharacterByNameOrAlias(workspace: StoredAudiobookWorkspace, name: string): AudiobookCharacter | undefined {
+  const normalizedName = name.trim();
+  if (!normalizedName) {
+    return undefined;
+  }
+  return workspace.characters.find((character) =>
+    character.name === normalizedName || character.aliases.some((alias) => alias === normalizedName)
+  );
+}
+
 function normalizeStoredWorkspace(raw: Record<string, unknown>): StoredWorkspace {
   // 向后兼容：旧数据没有 type 字段，默认为 board
   const type = (raw.type as string) || "board";
 
   if (type === "audiobook") {
+    const chapters = Array.isArray(raw.chapters) && raw.chapters.length > 0
+      ? raw.chapters.map((item, index) => normalizeAudiobookChapter(item as Record<string, unknown>, `章节 ${index + 1}`))
+      : [
+          normalizeAudiobookChapter({
+            id: "chapter-legacy",
+            title: "章节 1",
+            novelText: String(raw.novelText || ""),
+            characterHints: String(raw.characterHints || ""),
+            segments: Array.isArray(raw.segments) ? raw.segments as AudiobookSegment[] : [],
+            products: Array.isArray(raw.products) ? raw.products as AudiobookProduct[] : [],
+            phase: raw.phase === "annotation" || raw.phase === "generation" ? raw.phase : "character-creation",
+            createdAt: String(raw.createdAt || ""),
+            updatedAt: String(raw.updatedAt || "")
+          }, "章节 1")
+        ];
+    const activeChapterId = String(raw.activeChapterId || chapters[0]?.id || "");
+    const activeChapter = chapters.find((chapter) => chapter.id === activeChapterId) ?? chapters[0];
+    const characters = ensureNarratorCharacter(Array.isArray(raw.characters) ? raw.characters as AudiobookCharacter[] : []);
     return {
       id: String(raw.id || ""),
       type: "audiobook",
       name: String(raw.name || ""),
       createdAt: String(raw.createdAt || ""),
       updatedAt: String(raw.updatedAt || ""),
-      novelText: String(raw.novelText || ""),
-      characterHints: String(raw.characterHints || ""),
-      characters: Array.isArray(raw.characters) ? raw.characters as AudiobookCharacter[] : [],
-      segments: Array.isArray(raw.segments) ? raw.segments as AudiobookSegment[] : [],
-      products: Array.isArray(raw.products) ? raw.products as AudiobookProduct[] : [],
-      phase: (raw.phase as StoredAudiobookWorkspace["phase"]) || "character-creation"
+      activeChapterId: activeChapter.id,
+      novelText: activeChapter.novelText,
+      characterHints: activeChapter.characterHints,
+      characters,
+      segments: activeChapter.segments,
+      products: activeChapter.products,
+      phase: activeChapter.phase,
+      chapters
     };
   }
   return {
