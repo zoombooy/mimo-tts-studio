@@ -22,6 +22,7 @@ const allowedMimeTypes = new Set([
   "video/mp4"
 ]);
 const mimoEndpoint = "https://api.xiaomimimo.com/v1/chat/completions";
+const mimoTokenPlanEndpoint = "https://token-plan-cn.xiaomimimo.com/v1/chat/completions";
 const dataDir = path.resolve(process.env.MIMO_DATA_DIR || path.join(process.cwd(), "data"));
 const workspacesDir = path.join(dataDir, "workspaces");
 const workspaceFilePath = path.join(dataDir, "workspaces.json");
@@ -232,7 +233,9 @@ function getApiConfig(req: { headers: Record<string, string | string[] | undefin
   const apiKey = (typeof headerKey === "string" && headerKey.trim()) ? headerKey.trim() : process.env.MIMO_API_KEY;
 
   const headerEndpoint = req.headers["x-api-endpoint"];
-  const apiEndpoint = (typeof headerEndpoint === "string" && headerEndpoint.trim()) ? headerEndpoint.trim() : mimoEndpoint;
+  const apiEndpoint = (typeof headerEndpoint === "string" && headerEndpoint.trim())
+    ? headerEndpoint.trim()
+    : getDefaultMimoEndpoint(apiKey);
 
   return { apiKey, apiEndpoint };
 }
@@ -253,7 +256,7 @@ app.get("/api/settings", async (_req, res, next) => {
     const settings = await readApiSettings();
     res.json({
       apiKey: settings.apiKey ?? process.env.MIMO_API_KEY ?? "",
-      apiEndpoint: settings.apiEndpoint ?? mimoEndpoint,
+      apiEndpoint: settings.apiEndpoint ?? getDefaultMimoEndpoint(settings.apiKey ?? process.env.MIMO_API_KEY),
       configured: Boolean(settings.apiKey || process.env.MIMO_API_KEY)
     });
   } catch (error) {
@@ -272,7 +275,7 @@ app.put("/api/settings", async (req: Request<unknown, unknown, ApiSettings>, res
 
     const settings: ApiSettings = {
       apiKey,
-      apiEndpoint: apiEndpoint || mimoEndpoint
+      apiEndpoint: apiEndpoint || getDefaultMimoEndpoint(apiKey)
     };
 
     await writeApiSettings(settings);
@@ -303,7 +306,7 @@ app.post("/api/voice-style/optimize", async (req: Request<unknown, unknown, Voic
     }
 
     const payload = {
-      model: "mimo-v2-flash",
+      model: "mimo-v2.5-pro",
       messages: [
         {
           role: "system",
@@ -541,6 +544,11 @@ app.post("/api/workspaces/smart", upload.single("voice"), async (req: Request, r
         error: "Unsupported audio type. Please upload an mp3, m4a/mp4 audio, or wav file.",
         receivedMimeType: req.file.mimetype,
         fileName: req.file.originalname
+      });
+    }
+    if (voiceMime === "audio/m4a") {
+      return res.status(400).json({
+        error: "MiMo voice cloning only supports WAV or MP3 reference audio. Convert the MP4/M4A file before retrying."
       });
     }
 
@@ -917,6 +925,9 @@ app.post("/api/audiobook/:id/characters", upload.single("voice"), async (req: Re
     if (req.file && !voiceMime) {
       return res.status(400).json({ error: "仅支持 mp3、m4a/mp4 或 wav 参考音频。" });
     }
+    if (voiceMime === "audio/m4a") {
+      return res.status(400).json({ error: "MiMo 语音克隆仅支持 WAV 或 MP3，请先转换 MP4/M4A 文件。" });
+    }
 
     const referenceAudioDataUrl = req.file && voiceMime ? `data:${voiceMime};base64,${req.file.buffer.toString("base64")}` : undefined;
     const rawRoleType = String(req.body?.roleType || "");
@@ -984,6 +995,9 @@ app.put("/api/audiobook/:id/characters/:charId", upload.single("voice"), async (
       const voiceMime = req.file ? resolveVoiceMimeType(req.file) : null;
       if (req.file && !voiceMime) {
         throw Object.assign(new Error("仅支持 mp3、m4a/mp4 或 wav 参考音频。"), { status: 400 });
+      }
+      if (voiceMime === "audio/m4a") {
+        throw Object.assign(new Error("MiMo 语音克隆仅支持 WAV 或 MP3，请先转换 MP4/M4A 文件。"), { status: 400 });
       }
       if (!target.isSystem) {
         target.name = String(req.body?.name || target.name).trim() || target.name;
@@ -1662,6 +1676,13 @@ app.post("/api/tts/voiceclone", upload.single("voice"), async (req: Request, res
         fileName: req.file.originalname
       });
     }
+    if (voiceMime === "audio/m4a") {
+      return res.status(400).json({
+        error: "MiMo voice cloning only supports WAV or MP3 reference audio. Convert the MP4/M4A file before retrying.",
+        receivedMimeType: req.file.mimetype,
+        fileName: req.file.originalname
+      });
+    }
 
     const audioBase64 = req.file.buffer.toString("base64");
     const payload: MimoPayload = {
@@ -1752,7 +1773,10 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   }
 
   const message = error instanceof Error ? error.message : "Unexpected server error.";
-  res.status(500).json({ error: message });
+  const status = typeof error === "object" && error && "status" in error && typeof error.status === "number"
+    ? error.status
+    : 500;
+  res.status(status).json({ error: message });
 });
 
 export function startServer(listenPort = port, host?: string) {
@@ -1837,6 +1861,10 @@ function parseJson(value: string): unknown {
   } catch {
     return null;
   }
+}
+
+function getDefaultMimoEndpoint(apiKey: string | undefined): string {
+  return apiKey?.trim().startsWith("tp-") ? mimoTokenPlanEndpoint : mimoEndpoint;
 }
 
 function extractAudioData(value: unknown): string | null {
@@ -2713,6 +2741,9 @@ async function synthesizeAudiobookProduct(
   const character = await getAudiobookCharacterSnapshot(workspaceId, product.characterId);
   if (!character?.voiceDataUrl) {
     throw new Error(`${product.characterName || "当前角色"}缺少可复用音色，请先在音色库生成或上传参考音频。`);
+  }
+  if (/^data:(?:audio\/m4a|audio\/mp4|video\/mp4);/i.test(character.voiceDataUrl)) {
+    throw new Error(`${product.characterName || "当前角色"}的参考音频是 MP4/M4A，请重新上传 WAV 或 MP3。`);
   }
 
   const payload: MimoPayload = {

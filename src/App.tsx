@@ -279,8 +279,9 @@ const nodeCatalog: Record<
 };
 
 const autoSaveDelayMs = 30000;
-const DEFAULT_API_KEY = "sk-cbpjuoes34akq38omkqz9s08s7h9dxwe7cjshz5824kskliz";
+const DEFAULT_API_KEY = "";
 const DEFAULT_API_ENDPOINT = "https://api.xiaomimimo.com/v1/chat/completions";
+const TOKEN_PLAN_API_ENDPOINT = "https://token-plan-cn.xiaomimimo.com/v1/chat/completions";
 const API_KEY_STORAGE_KEY = "mimo-api-key";
 const API_ENDPOINT_STORAGE_KEY = "mimo-api-endpoint";
 
@@ -309,7 +310,10 @@ function StudioApp() {
   const flowRef = useRef<ReactFlowInstance<StudioNode, StudioEdge> | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem(API_KEY_STORAGE_KEY) || DEFAULT_API_KEY);
-  const [apiEndpoint, setApiEndpoint] = useState<string>(() => localStorage.getItem(API_ENDPOINT_STORAGE_KEY) || DEFAULT_API_ENDPOINT);
+  const [apiEndpoint, setApiEndpoint] = useState<string>(() => {
+    const storedKey = localStorage.getItem(API_KEY_STORAGE_KEY) || DEFAULT_API_KEY;
+    return resolveApiEndpoint(storedKey, localStorage.getItem(API_ENDPOINT_STORAGE_KEY) || "");
+  });
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState(apiKey);
   const [apiEndpointInput, setApiEndpointInput] = useState(apiEndpoint);
@@ -467,7 +471,7 @@ function StudioApp() {
       const localKey = localStorage.getItem(API_KEY_STORAGE_KEY) || "";
       const localEndpoint = localStorage.getItem(API_ENDPOINT_STORAGE_KEY) || "";
       const nextKey = settings.apiKey || localKey || DEFAULT_API_KEY;
-      const nextEndpoint = settings.apiEndpoint || localEndpoint || DEFAULT_API_ENDPOINT;
+      const nextEndpoint = resolveApiEndpoint(nextKey, settings.apiEndpoint || localEndpoint);
 
       setApiKey(nextKey);
       setApiEndpoint(nextEndpoint);
@@ -494,16 +498,12 @@ function StudioApp() {
     const trimmedKey = apiKeyInput.trim();
     const trimmedEndpoint = apiEndpointInput.trim();
     if (!trimmedKey) return;
+    const resolvedEndpoint = resolveApiEndpoint(trimmedKey, trimmedEndpoint);
     setApiKey(trimmedKey);
     localStorage.setItem(API_KEY_STORAGE_KEY, trimmedKey);
-    if (trimmedEndpoint) {
-      setApiEndpoint(trimmedEndpoint);
-      localStorage.setItem(API_ENDPOINT_STORAGE_KEY, trimmedEndpoint);
-    } else {
-      setApiEndpoint(DEFAULT_API_ENDPOINT);
-      localStorage.removeItem(API_ENDPOINT_STORAGE_KEY);
-    }
-    void persistApiSettings(trimmedKey, trimmedEndpoint || DEFAULT_API_ENDPOINT);
+    setApiEndpoint(resolvedEndpoint);
+    localStorage.setItem(API_ENDPOINT_STORAGE_KEY, resolvedEndpoint);
+    void persistApiSettings(trimmedKey, resolvedEndpoint);
     closeApiKeyModal();
     void loadStatus();
   }
@@ -1099,9 +1099,12 @@ function StudioApp() {
     patchNode(nodeId, { isRunning: true, error: undefined });
 
     try {
+      const voiceFile = await prepareReferenceAudioFile(
+        dataUrlToFile(resolved.audio.dataUrl, resolved.audio.fileName, resolved.audio.mimeType)
+      );
       for (const [index, item] of cloneTexts.filter((entry) => entry.text.trim()).entries()) {
         const formData = new FormData();
-        formData.append("voice", dataUrlToFile(resolved.audio.dataUrl, resolved.audio.fileName, resolved.audio.mimeType));
+        formData.append("voice", voiceFile);
         formData.append("text", item.text.trim());
         formData.append("instruction", resolved.instruction.trim());
         formData.append("format", "wav");
@@ -1114,7 +1117,10 @@ function StudioApp() {
         const payload = (await response.json()) as DebugResponse & { error?: string; details?: unknown };
 
         if (!response.ok) {
-          patchNode(nodeId, { isRunning: false, error: payload.error || `第 ${index + 1} 条音频克隆失败。` });
+          patchNode(nodeId, {
+            isRunning: false,
+            error: formatApiError(payload, `第 ${index + 1} 条音频克隆失败。`)
+          });
           return;
         }
 
@@ -1181,7 +1187,10 @@ function StudioApp() {
         const payload = (await response.json()) as DebugResponse & { error?: string; details?: unknown };
 
         if (!response.ok) {
-          patchNode(nodeId, { isRunning: false, error: payload.error || `第 ${index + 1} 条音色创造失败。` });
+          patchNode(nodeId, {
+            isRunning: false,
+            error: formatApiError(payload, `第 ${index + 1} 条音色创造失败。`)
+          });
           return;
         }
 
@@ -1347,10 +1356,10 @@ function StudioApp() {
         </div>
       </header>
 
-      {apiKey === DEFAULT_API_KEY && showDefaultKeyWarning ? (
+      {!apiKey && showDefaultKeyWarning ? (
         <section className="api-warning">
           <AlertTriangle size={18} />
-          <span>当前使用的是默认 API Key，不保证长期可用。请点击右上角 API Key 区域配置自己的密钥。</span>
+          <span>尚未配置 API Key。请点击右上角 API Key 区域配置自己的密钥。</span>
           <button className="api-warning-close" type="button" onClick={() => setShowDefaultKeyWarning(false)}>
             <X size={16} />
           </button>
@@ -1382,18 +1391,18 @@ function StudioApp() {
                 className="api-key-input"
                 value={apiKeyInput}
                 onChange={(e) => setApiKeyInput(e.target.value)}
-                placeholder="sk-..."
+                placeholder="tp-... 或 sk-..."
                 spellCheck={false}
               />
-              {apiKey === DEFAULT_API_KEY && (
+              {!apiKey && (
                 <p className="api-key-modal-warn">
                   <AlertTriangle size={14} />
-                  当前使用的默认 Key 不可长期使用，不保证可用性，建议尽快配置自己的密钥。
+                  当前尚未配置 API Key。
                 </p>
               )}
               <div className="api-endpoint-section">
                 <p className="api-key-modal-hint">
-                  API 地址（可选，留空使用默认地址）：
+                  API 地址（可选，留空时会根据 Key 类型自动选择）：
                 </p>
                 <input
                   type="text"
@@ -1404,7 +1413,7 @@ function StudioApp() {
                   spellCheck={false}
                 />
                 <p className="api-endpoint-hint">
-                  token 套餐计划可使用：https://token-plan-cn.xiaomimimo.com/v1/chat/completions
+                  tp- 开头的套餐 Key：https://token-plan-cn.xiaomimimo.com/v1/chat/completions
                 </p>
                 <p className="api-endpoint-hint">
                   非套餐请保持默认
@@ -1654,9 +1663,14 @@ function BoardCreateDialog({
       return;
     }
 
-    setVoiceFile(file);
-    setVoicePreviewUrl(await blobToDataUrl(file));
-    setError(null);
+    try {
+      const compatibleFile = await prepareReferenceAudioFile(file);
+      setVoiceFile(compatibleFile);
+      setVoicePreviewUrl(await blobToDataUrl(compatibleFile));
+      setError(null);
+    } catch (conversionError) {
+      setError(conversionError instanceof Error ? conversionError.message : "参考音频转换失败。");
+    }
   }
 
   function onFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -1995,6 +2009,7 @@ function AudiobookConsole({
   const [characterTraits, setCharacterTraits] = useState("");
   const [characterAliases, setCharacterAliases] = useState("");
   const [characterVoiceFile, setCharacterVoiceFile] = useState<File | null>(null);
+  const [characterVoiceFileError, setCharacterVoiceFileError] = useState("");
   const [isCreatingCharacter, setIsCreatingCharacter] = useState(false);
   const productSectionRef = useRef<HTMLDivElement | null>(null);
   const progressTimerRef = useRef<number | null>(null);
@@ -2181,8 +2196,30 @@ function AudiobookConsole({
       setCharacterTraits("");
       setCharacterAliases("");
       setCharacterVoiceFile(null);
+      setCharacterVoiceFileError("");
     } finally {
       setIsCreatingCharacter(false);
+    }
+  }
+
+  async function handleCharacterVoiceFile(file: File | null) {
+    if (!file) {
+      setCharacterVoiceFile(null);
+      setCharacterVoiceFileError("");
+      return;
+    }
+    if (file.size > maxAudioBytes) {
+      setCharacterVoiceFile(null);
+      setCharacterVoiceFileError(`参考音频不能超过 ${formatBytes(maxAudioBytes)}。`);
+      return;
+    }
+
+    try {
+      setCharacterVoiceFile(await prepareReferenceAudioFile(file));
+      setCharacterVoiceFileError("");
+    } catch (error) {
+      setCharacterVoiceFile(null);
+      setCharacterVoiceFileError(error instanceof Error ? error.message : "参考音频转换失败。");
     }
   }
 
@@ -2318,10 +2355,11 @@ function AudiobookConsole({
                 <input
                   type="file"
                   accept="audio/mpeg,audio/mp3,audio/mp4,audio/m4a,audio/wav,audio/wave,video/mp4"
-                  onChange={(event) => setCharacterVoiceFile(event.target.files?.[0] ?? null)}
+                  onChange={(event) => void handleCharacterVoiceFile(event.target.files?.[0] ?? null)}
                 />
               </label>
             )}
+            {characterVoiceFileError ? <small className="section-hint">{characterVoiceFileError}</small> : null}
             <button className="run-button" type="button" onClick={() => void handleCreateCharacter()} disabled={isCreatingCharacter || !characterName.trim()}>
               {isCreatingCharacter ? <Loader2 className="spin" size={14} /> : <Plus size={14} />}
               {isCreatingCharacter ? "创建中..." : "创建音色角色"}
@@ -2561,7 +2599,7 @@ function ReferenceAudioNode({ id, data }: NodeProps<StudioNode>) {
     };
   }, []);
 
-  function onFileChange(event: ChangeEvent<HTMLInputElement>) {
+  async function onFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) {
       return;
@@ -2577,21 +2615,24 @@ function ReferenceAudioNode({ id, data }: NodeProps<StudioNode>) {
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = String(reader.result);
+    try {
+      const compatibleFile = await prepareReferenceAudioFile(file);
+      const dataUrl = await blobToDataUrl(compatibleFile);
       setPreviewUrl(dataUrl);
       data.onPatch?.(id, {
         audio: {
-          fileName: file.name,
-          mimeType: file.type || guessMimeFromName(file.name),
-          size: file.size,
+          fileName: compatibleFile.name,
+          mimeType: compatibleFile.type || guessMimeFromName(compatibleFile.name),
+          size: compatibleFile.size,
           dataUrl
         },
         error: undefined
       });
-    };
-    reader.readAsDataURL(file);
+    } catch (conversionError) {
+      data.onPatch?.(id, {
+        error: conversionError instanceof Error ? conversionError.message : "参考音频转换失败。"
+      });
+    }
   }
 
   async function startRecording() {
@@ -2915,11 +2956,11 @@ function ContextMenu({ menu, onAdd }: { menu: { x: number; y: number }; onAdd: (
 
 function StatusPill({ apiKey, onOpenModal }: { apiKey: string; onOpenModal: () => void }) {
   const masked = apiKey.length > 8 ? `${apiKey.slice(0, 3)}***${apiKey.slice(-4)}` : "***";
-  const isDefault = apiKey === DEFAULT_API_KEY;
+  const isDefault = !apiKey;
   return (
     <button className={`status-pill ${isDefault ? "warn" : "good"}`} type="button" onClick={onOpenModal}>
       <Key size={14} />
-      <span>API Key: {masked}</span>
+      <span>{apiKey ? `API Key: ${masked}` : "API Key: 未配置"}</span>
     </button>
   );
 }
@@ -3213,6 +3254,56 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType: string): Fil
   return new File([bytes], fileName, { type: resolvedMime });
 }
 
+function getDefaultApiEndpoint(apiKey: string): string {
+  return apiKey.trim().startsWith("tp-") ? TOKEN_PLAN_API_ENDPOINT : DEFAULT_API_ENDPOINT;
+}
+
+function resolveApiEndpoint(apiKey: string, configuredEndpoint: string): string {
+  const endpoint = configuredEndpoint.trim();
+  if (!endpoint || endpoint === DEFAULT_API_ENDPOINT || endpoint === TOKEN_PLAN_API_ENDPOINT) {
+    return getDefaultApiEndpoint(apiKey);
+  }
+  return endpoint;
+}
+
+function isMimoCompatibleReferenceAudio(file: File): boolean {
+  if (["audio/mp4", "audio/m4a", "video/mp4"].includes(file.type) || /\.(m4a|mp4)$/i.test(file.name)) {
+    return false;
+  }
+  return (
+    file.type === "audio/wav" ||
+    file.type === "audio/x-wav" ||
+    file.type === "audio/wave" ||
+    file.type === "audio/mpeg" ||
+    file.type === "audio/mp3" ||
+    /\.(wav|mp3)$/i.test(file.name)
+  );
+}
+
+async function prepareReferenceAudioFile(file: File): Promise<File> {
+  if (isMimoCompatibleReferenceAudio(file)) {
+    return file;
+  }
+
+  if (!/\.(m4a|mp4)$/i.test(file.name) && !["audio/mp4", "audio/m4a", "video/mp4"].includes(file.type)) {
+    throw new Error("MiMo 语音克隆仅支持 WAV 或 MP3 参考音频。");
+  }
+
+  let wavBlob: Blob;
+  try {
+    wavBlob = await convertAudioBlobToWav(file);
+  } catch {
+    throw new Error("无法将 MP4/M4A 解码为 WAV，请改用 WAV 或 MP3 文件。");
+  }
+
+  if (wavBlob.size > maxAudioBytes) {
+    throw new Error(`转换后的 WAV 超过 ${formatBytes(maxAudioBytes)}，请缩短参考音频。`);
+  }
+
+  const baseName = file.name.replace(/\.(m4a|mp4)$/i, "") || "reference-audio";
+  return new File([wavBlob], `${baseName}.wav`, { type: "audio/wav" });
+}
+
 function dataUrlToUint8Array(dataUrl: string): Uint8Array {
   const base64 = dataUrl.split(",")[1] ?? "";
   const binary = atob(base64);
@@ -3229,6 +3320,10 @@ function getSupportedRecordingMimeType(): string {
 }
 
 async function convertRecordedBlobToWav(blob: Blob): Promise<Blob> {
+  return convertAudioBlobToWav(blob);
+}
+
+async function convertAudioBlobToWav(blob: Blob): Promise<Blob> {
   const AudioContextConstructor = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
   if (!AudioContextConstructor) {
     throw new Error("当前浏览器无法处理录音，请改用上传音频文件。");
@@ -3237,10 +3332,38 @@ async function convertRecordedBlobToWav(blob: Blob): Promise<Blob> {
   const audioContext = new AudioContextConstructor();
   try {
     const audioBuffer = await audioContext.decodeAudioData(await blob.arrayBuffer());
-    return encodeAudioBufferToWav(audioBuffer);
+    const targetSampleRate = Math.min(audioBuffer.sampleRate, 24000);
+    const targetFrameCount = Math.max(1, Math.ceil(audioBuffer.duration * targetSampleRate));
+    const offlineContext = new OfflineAudioContext(1, targetFrameCount, targetSampleRate);
+    const source = offlineContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offlineContext.destination);
+    source.start();
+    return encodeAudioBufferToWav(await offlineContext.startRendering());
   } finally {
     await audioContext.close();
   }
+}
+
+function formatApiError(payload: { error?: string; details?: unknown }, fallback: string): string {
+  const summary = payload.error?.trim() || fallback;
+  const detail = extractApiErrorMessage(payload.details);
+  return detail && detail !== summary ? `${summary} ${detail}` : summary;
+}
+
+function extractApiErrorMessage(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+
+  const candidate = value as { message?: unknown; error?: unknown };
+  if (typeof candidate.message === "string") {
+    return candidate.message.trim();
+  }
+  return extractApiErrorMessage(candidate.error);
 }
 
 function encodeAudioBufferToWav(audioBuffer: AudioBuffer): Blob {
